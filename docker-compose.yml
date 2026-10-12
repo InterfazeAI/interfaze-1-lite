@@ -4,7 +4,7 @@ services:
     image: interfaze-1-lite
     ports: ["8000:8000"]
     environment:
-      HF_TOKEN: ${HF_TOKEN:?set HF_TOKEN; the diarization and guard models are gated}
+      HF_TOKEN: ${HF_TOKEN:?set HF_TOKEN; the diarization model is gated}
       # Optional: require this key as "Authorization: Bearer <key>" on every request.
       API_KEY: ${API_KEY:-}
     volumes:

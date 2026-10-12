@@ -83,7 +83,7 @@ vllm serve "${COMPONENT_OCR_VLM}" --host 127.0.0.1 --port 8004 \
     --gpu-memory-utilization "${OCR_GPU_FRACTION:-0.20}" \
     --enable-prefix-caching \
     --limit-mm-per-prompt '{"image": 1}' \
-    --chat-template-content-format openai \
+    --chat-template-content-format string \
     --trust-remote-code &
 PIDS+=($!); wait_for "document reader" http://127.0.0.1:8004/health "$!" 3600
 

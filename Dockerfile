@@ -31,7 +31,7 @@ RUN pip install --no-cache-dir \
         huggingface_hub accelerate "fastapi[standard]" python-multipart httpx pillow numpy soundfile \
         pyannote.audio \
         "paddleocr==3.3.2" "opencv-python-headless>=4.13.0" "paddlepaddle==3.2.2" \
-        "chandra-ocr>=0.2.0" pymupdf \
+        pymupdf \
         "sam-2 @ git+https://github.com/facebookresearch/sam2.git@2b90b9f5ceec907a1c18123530e92e794ad901a4" \
         einops peft "decord==0.6.0" "lmdb==1.7.5" \
         "nemo_toolkit[asr]"
