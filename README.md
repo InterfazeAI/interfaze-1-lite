@@ -1,12 +1,12 @@
-![Interfaze 1 Lite](assets/interfaze-1-lite-banner.png)
+![Interfaze 1.1 Lite](assets/interfaze-1.1-lite-banner.png)
 
-# Interfaze 1 Lite
+# Interfaze 1.1 Lite
 
 [Website](https://interfaze.ai) · [Docs](https://interfaze.ai/docs/models/interfaze-1-lite) · [Run tasks](https://interfaze.ai/docs/run-tasks) · [Blog](https://interfaze.ai/blog/the-first-open-weight-model-for-deterministic-work-interfaze-1-lite) · [Hugging Face](https://huggingface.co/interfaze-ai/interfaze-1-lite)
 
 ## Introduction
 
-Interfaze 1 Lite is a mixture-of-architectures (MoA) model for developer workloads: reading documents, transcribing speech, locating objects and interface elements, and answering over all of it with structured output.
+Interfaze 1.1 Lite is a mixture-of-architectures (MoA) model for developer workloads: reading documents, transcribing speech, locating objects and interface elements, and answering over all of it with structured output.
 
 A single vision-language reasoning core works alongside a set of specialist architectures, each built for one kind of perception. The core reads the request, decides which specialists to run, and composes the answer from what they return. The whole model runs on one 80 GB GPU with no external services.
 
@@ -22,10 +22,10 @@ A single vision-language reasoning core works alongside a set of specialist arch
 
 ### Model architecture
 
-Interfaze 1 Lite is not one network. It is a reasoning core plus specialists, each chosen for the task it is best at, connected by tool calls.
+Interfaze 1.1 Lite is not one network. It is a reasoning core plus specialists, each chosen for the task it is best at, connected by tool calls.
 
 | Component | Architecture | Role |
-|---|---|---|
+| --- | --- | --- |
 | Reasoning core | Hybrid-attention decoder with a vision encoder, FP8, 131k context | Plans, calls specialists, grounds boxes on a 0–1000 grid, writes the answer |
 | Document reader | Vision-language model trained for page reading | Text, reading order, tables and markdown |
 | Line geometry | Text detector and recognizer | Every line's box and confidence |
@@ -34,7 +34,7 @@ Interfaze 1 Lite is not one network. It is a reasoning core plus specialists, ea
 | Diarization | Speaker segmentation and embedding pipeline | Who spoke when |
 | Segmentation | Promptable segmentation model | Object outlines and masks |
 | Forecasting | Time-series foundation model | Future values of a numeric series |
-| Guardrails | Safety classifier | 14 text safety categories |
+| Guardrails | Safety classifier | Text safety in 119 languages, reported as S1–S14 codes (S6 and S14 never) |
 
 How the parts combine:
 
@@ -46,7 +46,7 @@ How the parts combine:
 ## Performance
 
 | Benchmark | What it measures | **Interfaze 1 Lite** | Interfaze | GPT-5.4-Mini | Claude-Sonnet-4.6 | Gemini-3-Flash | Grok-4.3 |
-|---|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- | --- |
 | GPQA Diamond | Graduate-level science | **85.9** | 92.4 | 82.8 | 89.9 | 88.5 | 73.6 |
 | MMMLU | Knowledge in 14 languages | **87.8** | 90.9 | 75.3 | 84.9 | 88.7 | 89.7 |
 | MMMU-Pro | Multimodal reasoning | **73.2** | 71.1 | 40.4 | 46.3 | 67.6 | 68.7 |
@@ -57,7 +57,7 @@ How the parts combine:
 | SOB (value accuracy) | Structured output from text, images and audio | **81.5** | 80.5 | – | 77.9 | 77.3* | – |
 | Spider 2.0-Lite (SQLite) | Text-to-SQL | **48.9** | 52.9 | 26.7 | 49.6 | 45.2 | 45.9 |
 
-Interfaze 1 Lite was scored by us with each benchmark's official scorer ([evaluation code](https://github.com/InterfazeAI/interfaze-complete-benchmarks/tree/main/interfaze-lite-evals)). Every other score is from the [Interfaze leaderboard](https://interfaze.ai/leaderboards). Higher is better except WER. \*Gemini-3-Flash-Preview.
+These are Interfaze 1 Lite's scores: 1.1 changes the document reader and the guard, and its own scores will replace them once measured. Interfaze 1 Lite was scored by us with each benchmark's official scorer ([evaluation code](https://github.com/InterfazeAI/interfaze-complete-benchmarks/tree/main/interfaze-lite-evals)). Every other score is from the [Interfaze leaderboard](https://interfaze.ai/leaderboards). Higher is better except WER. \*Gemini-3-Flash-Preview.
 
 ### The benchmarks
 
@@ -77,7 +77,7 @@ Interfaze 1 Lite was scored by us with each benchmark's official scorer ([evalua
 
 - One 80 GB GPU with compute capability 8.9 or newer (Hopper, Ada). Tested on an H100.
 - Docker with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
-- A Hugging Face token that can read two gated models: [speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1) and [Llama Guard 3](https://huggingface.co/meta-llama/Llama-Guard-3-1B). Accept their terms on Hugging Face first.
+- A Hugging Face token that can read the gated [speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1) model. Accept its terms on Hugging Face first.
 - About 64 GB of RAM and 60 GB of disk for the weights.
 
 To run the model in Python without a server, through 🤗 Transformers, see the [Hugging Face repo](https://huggingface.co/interfaze-ai/interfaze-1-lite).
@@ -133,7 +133,7 @@ curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/jso
 ```
 
 | Task | Returns |
-|---|---|
+| --- | --- |
 | `ocr` | `extracted_text`, `sections[]` (one per page, with `lines[].words[]`, four-corner `bounds`, `average_confidence`), `width`, `height` |
 | `speech_to_text` | `text` and `chunks[]` with timestamps |
 | `object_detection` | `detected_objects[]`, each with a `label` and four-corner `bounds` |
@@ -141,13 +141,13 @@ curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/jso
 | `translate` | `translated_text`, `source_language`, `target_language` |
 | `forecast` | `predictions[]`, each a `date` and a `value` |
 
-Send audio as an `input_audio` part. Coordinates are pixels of the input: an image's own size, or a PDF page at 144 DPI. To screen a message before it reaches your app, put the categories to check in the system message, for example `<guard>S1, S2, S10</guard>`.
+Send audio as an `input_audio` part. Coordinates are pixels of the input: an image's own size, or the rendered PDF page whose `width` and `height` the result reports. To screen a message before it reaches your app, put the categories to check in the system message, for example `<guard>S1, S2, S10</guard>`.
 
 ### Configure
 
 | Variable | Default | |
-|---|---|---|
-| `HF_TOKEN` | – | Required. Reads the gated models. |
+| --- | --- | --- |
+| `HF_TOKEN` | – | Required. Reads the gated diarization model. |
 | `API_KEY` | unset | Require `Authorization: Bearer <key>` on every request. Set it on any server reachable from outside. |
 | `GPU_FRACTION` | `0.56` | Share of the GPU for the reasoning core. |
 | `OCR_GPU_FRACTION` | `0.20` | Share of the GPU for the document reader. |
@@ -262,8 +262,31 @@ print(res.choices[0].message.content)
 - Generation through transformers is correct but slower than a serving engine with paged attention and batching. For throughput, use the Interfaze API or serve the model with a batching engine.
 - `chat` does not take a response schema; ask for JSON in the prompt, or use the API's `response_format`.
 - A dense document page can take a minute or more to read on the transformers path.
-- Memory: processing large PDFs can spike in significant use of CUDA memory.
+- Large PDFs can spike CUDA memory use.
 
-## Thank you
+## Thank You
 
-We are grateful for the inspiration from these models and the teams behind them: [Qwen3.8 27B](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) from the Qwen team, [Chandra OCR 2](https://huggingface.co/datalab-to/chandra-ocr-2) from Datalab, [Whisper large-v3 turbo](https://huggingface.co/openai/whisper-large-v3-turbo) from OpenAI, [speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1) from pyannote, [SAM 2.1](https://huggingface.co/facebook/sam2.1-hiera-large) and [Llama Guard 3](https://huggingface.co/meta-llama/Llama-Guard-3-1B) from Meta, [TimesFM 2.5](https://huggingface.co/google/timesfm-2.5-200m-pytorch) from Google Research, and [PP-OCRv5 detection](https://huggingface.co/PaddlePaddle/PP-OCRv5_server_det), [PP-OCRv5 recognition](https://huggingface.co/PaddlePaddle/en_PP-OCRv5_mobile_rec) and [PP-DocLayout](https://huggingface.co/PaddlePaddle/PP-DocLayout_plus-L) from PaddlePaddle. Thanks also to the open-source projects that run them: [vLLM](https://github.com/vllm-project/vllm), [Hugging Face Transformers](https://github.com/huggingface/transformers), [pyannote.audio](https://github.com/pyannote/pyannote-audio), [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR), [SAM 2](https://github.com/facebookresearch/sam2) and [TimesFM](https://github.com/google-research/timesfm).
+We are grateful to the teams behind the models and open-source projects whose work we use and build upon.
+
+### Models
+
+1. [Qwen3.8 27B](https://huggingface.co/Qwen/Qwen3.8-27B-FP8)
+2. [dots.mocr](https://huggingface.co/dots-studio/dots.mocr)
+3. [Whisper large-v3 turbo](https://huggingface.co/openai/whisper-large-v3-turbo)
+4. [speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1)
+5. [SAM 2.1](https://huggingface.co/facebook/sam2.1-hiera-large)
+6. [Qwen3Guard](https://huggingface.co/Qwen/Qwen3Guard-Gen-0.6B)
+7. [TimesFM 2.5](https://huggingface.co/google/timesfm-2.5-200m-pytorch)
+8. [PP-OCRv5 Detection](https://huggingface.co/PaddlePaddle/PP-OCRv5_server_det)
+9. [PP-DocLayout](https://huggingface.co/PaddlePaddle/PP-DocLayout_plus-L)
+
+### Open-Source Projects
+
+Special thanks to the open-source projects that make these models possible:
+
+1. [vLLM](https://github.com/vllm-project/vllm)
+2. [Hugging Face Transformers](https://github.com/huggingface/transformers)
+3. [pyannote.audio](https://github.com/pyannote/pyannote-audio)
+4. [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR)
+5. [SAM 2](https://github.com/facebookresearch/sam2)
+6. [TimesFM](https://github.com/google-research/timesfm)
