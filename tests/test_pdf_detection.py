@@ -30,9 +30,16 @@ def _ctx(url, seen):
         with Image.open(image) as img:
             seen.append((image, img.size))
         # One box per page, on the 0-1000 grid the brain answers in.
-        return {"gui_elements": [{"label": prompts[0], "bounds": {
-            "top_left": {"x": 100, "y": 100}, "bottom_right": {"x": 500, "y": 500}}}],
-            "width": img.size[0], "height": img.size[1]}
+        return {
+            "gui_elements": [
+                {
+                    "label": prompts[0],
+                    "bounds": {"top_left": {"x": 100, "y": 100}, "bottom_right": {"x": 500, "y": 500}},
+                }
+            ],
+            "width": img.size[0],
+            "height": img.size[1],
+        }
 
     refs = FileRefs()
     refs.add(url, filename=os.path.basename(url))
@@ -50,17 +57,16 @@ def test_every_page_is_searched_and_each_box_names_its_page(tmp_path):
     # A letter page at 144 DPI, and the box in that page's pixels.
     assert all(size == (1224, 1584) for _, size in seen)
     assert objects[0]["bounds"]["top_left"] == {"x": 122, "y": 158}
-    assert result.model_facing["pages"] == [
-        {"page": n, "width": 1224, "height": 1584} for n in (1, 2, 3)]
-    # The rendered pages are gone once the tool returns.
+    assert result.model_facing["pages"] == [{"page": n, "width": 1224, "height": 1584} for n in (1, 2, 3)]
     assert not any(os.path.exists(path) for path, _ in seen)
 
 
 def test_page_range_limits_the_search(tmp_path):
     seen = []
     url = _pdf(tmp_path / "doc.pdf", count=5)
-    result = asyncio.run(_run_detection(
-        {"file_ref_id": "ref-0", "prompts": ["logo"], "page_range": [2, 3]}, _ctx(url, seen)))
+    result = asyncio.run(
+        _run_detection({"file_ref_id": "ref-0", "prompts": ["logo"], "page_range": [2, 3]}, _ctx(url, seen))
+    )
     assert [o["page"] for o in result.model_facing["detected_objects"]] == [2, 3]
 
 
@@ -74,7 +80,7 @@ def test_an_image_is_searched_as_before(tmp_path):
     assert "pages" not in result.model_facing
 
 
-def test_a_url_that_does_not_say_pdf_is_not_fetched_here(monkeypatch):
+def test_a_url_that_does_not_say_pdf_is_not_fetched_here():
     refs = FileRefs()
     refs.add("https://x/photo.png")
     ctx = ToolContext(refs=refs, http=None, settings=Settings())

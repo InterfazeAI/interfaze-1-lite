@@ -6,6 +6,7 @@ import time
 import types
 
 import pytest
+from fastapi import HTTPException
 
 from interfaze_lite.services import perception
 
@@ -61,9 +62,7 @@ def test_nothing_loads_early_unless_asked(fake_model, monkeypatch):
 
 
 def test_a_failed_request_is_collected_before_the_next_runs(monkeypatch):
-    """A transcription that ran out of memory still held 16 GB after it answered, and the
-    retry ran out of memory on 86 MB. Collected inside the failure, nothing is freed."""
-    from fastapi import HTTPException
+    """An OOM transcription held 16 GB after answering; collecting inside the failure freed nothing."""
 
     class Model:
         def transcribe(self, *args, **kwargs):
