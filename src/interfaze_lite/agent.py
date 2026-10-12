@@ -21,39 +21,80 @@ except ImportError:  # the files run flat, from a checkout
 _FILE = {"type": "string", "description": "The file's reference id from All File References, e.g. ref-0."}
 
 TOOLS: list[dict[str, Any]] = [
-    {"type": "function", "function": {
-        "name": "ocr",
-        "description": "Read an image, PDF or Word document the user supplied: its full text, "
-                       "with every line's position.",
-        "parameters": {"type": "object", "properties": {
-            "file_ref_id": _FILE,
-            "page_range": {"type": "array", "items": {"type": "integer"},
-                           "description": "First and last page to read, 1-based, for a long PDF."},
-        }, "required": ["file_ref_id"]}}},
-    {"type": "function", "function": {
-        "name": "stt",
-        "description": "Transcribe an audio file, optionally labelling who said what.",
-        "parameters": {"type": "object", "properties": {
-            "file_ref_id": _FILE,
-            "by_speaker": {"type": "boolean", "description": "Split the transcript by speaker."},
-        }, "required": ["file_ref_id"]}}},
-    {"type": "function", "function": {
-        "name": "object_detection",
-        "description": "Find objects in a photo: a box and label for each.",
-        "parameters": {"type": "object", "properties": {
-            "file_ref_id": _FILE,
-            "prompts": {"type": "array", "items": {"type": "string"},
-                        "description": "What to find, as simple noun phrases, e.g. ['person', 'car']."},
-        }, "required": ["file_ref_id", "prompts"]}}},
-    {"type": "function", "function": {
-        "name": "gui_detection",
-        "description": "Find interactive elements in a UI screenshot -- buttons, inputs, links -- "
-                       "each named by its visible label.",
-        "parameters": {"type": "object", "properties": {
-            "file_ref_id": _FILE,
-            "prompts": {"type": "array", "items": {"type": "string"},
-                        "description": "Elements to find; leave out for every interactive element."},
-        }, "required": ["file_ref_id"]}}},
+    {
+        "type": "function",
+        "function": {
+            "name": "ocr",
+            "description": "Read an image, PDF or Word document the user supplied: its full text, "
+            "with every line's position.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_ref_id": _FILE,
+                    "page_range": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "First and last page to read, 1-based, for a long PDF.",
+                    },
+                },
+                "required": ["file_ref_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stt",
+            "description": "Transcribe an audio file, optionally labelling who said what.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_ref_id": _FILE,
+                    "by_speaker": {"type": "boolean", "description": "Split the transcript by speaker."},
+                },
+                "required": ["file_ref_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "object_detection",
+            "description": "Find objects in a photo: a box and label for each.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_ref_id": _FILE,
+                    "prompts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "What to find, as simple noun phrases, e.g. ['person', 'car'].",
+                    },
+                },
+                "required": ["file_ref_id", "prompts"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "gui_detection",
+            "description": "Find interactive elements in a UI screenshot -- buttons, inputs, links -- "
+            "each named by its visible label.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_ref_id": _FILE,
+                    "prompts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Elements to find; leave out for every interactive element.",
+                    },
+                },
+                "required": ["file_ref_id"],
+            },
+        },
+    },
 ]
 
 # The model reads this much of a tool result; the caller gets all of it.
@@ -102,11 +143,15 @@ def visible(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
 
 
-def run(messages: list[dict], files: Sequence[str], *,
-        generate: Callable[..., str],
-        tools: dict[str, Callable[[str, dict], tuple[dict, dict]]],
-        show_images: Callable[[list[dict], dict[str, str]], list[dict]],
-        max_tool_steps: int = 6) -> dict[str, Any]:
+def run(
+    messages: list[dict],
+    files: Sequence[str],
+    *,
+    generate: Callable[..., str],
+    tools: dict[str, Callable[[str, dict], tuple[dict, dict]]],
+    show_images: Callable[[list[dict], dict[str, str]], list[dict]],
+    max_tool_steps: int = 6,
+) -> dict[str, Any]:
     """Answer `messages`, calling `tools` on `files` as the brain asks.
 
     `generate(convo, tools=..., keep_markup=...)` is one brain turn. Each tool takes the
@@ -117,7 +162,8 @@ def run(messages: list[dict], files: Sequence[str], *,
     system = SYSTEM_PROMPT
     if refs:
         system += "\n\nAll File References:\n" + "\n".join(
-            f"- {ref}: {os.path.basename(path.split('?')[0]) or path}" for ref, path in refs.items())
+            f"- {ref}: {os.path.basename(path.split('?')[0]) or path}" for ref, path in refs.items()
+        )
     convo = [{"role": "system", "content": system}, *messages]
     precontext: list[dict[str, Any]] = []
     used = nudged = shown = False
@@ -126,30 +172,33 @@ def run(messages: list[dict], files: Sequence[str], *,
         reply = generate(convo, tools=TOOLS if refs else None, keep_markup=True)
         calls = tool_calls(reply)
         if not calls:
-            # A file is attached and nothing has read it: answered by eye, the text is
-            # invented. One reminder, as the service gives.
+            # Attached but unread: an answer by eye invents the text. One reminder, as in the service.
             if refs and not used and not nudged:
                 nudged = True
                 convo = [*convo, {"role": "user", "content": NUDGE}]
                 continue
             return {"content": visible(reply), "precontext": precontext}
 
-        convo.append({"role": "assistant", "content": "", "tool_calls": [
-            {"type": "function", "function": {"name": c["name"], "arguments": c["arguments"]}}
-            for c in calls]})
+        convo.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"type": "function", "function": {"name": c["name"], "arguments": c["arguments"]}}
+                    for c in calls
+                ],
+            }
+        )
         for call in calls:
             full, seen = _dispatch(call, refs, tools)
-            # Tried counts as used, as in the service: a failed call goes back to the
-            # model to correct, not to be reminded that a file exists.
-            used = True
+            used = True  # A failed call too: it goes back to be corrected, not nudged, as in the service.
             if "error" not in seen:
                 precontext.append({"name": call["name"], "result": full})
             convo.append({"role": "tool", "content": json.dumps(seen, ensure_ascii=False)})
         if precontext and not shown:
             convo, shown = show_images(convo, refs), True
 
-    return {"content": visible(generate(convo, tools=None, keep_markup=False)),
-            "precontext": precontext}
+    return {"content": visible(generate(convo, tools=None, keep_markup=False)), "precontext": precontext}
 
 
 def _dispatch(call: dict, refs: dict[str, str], tools: dict) -> tuple[dict, dict]:

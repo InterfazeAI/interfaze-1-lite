@@ -11,12 +11,17 @@ async def _run_stt(args: dict, ctx: ToolContext) -> ToolResult:
 
     # The speaker join needs word timing, estimated on a long recording unless the caller
     # asked for word timestamps; otherwise segments come back by default.
-    transcript = await _post(ctx, ctx.settings.perception_url, "/transcribe", {
-        "url": url,
-        "language": args.get("language_code", "auto"),
-        "word_timestamps": bool(args.get("word_timestamps")),
-        "words_for_speakers": by_speaker,
-    })
+    transcript = await _post(
+        ctx,
+        ctx.settings.perception_url,
+        "/transcribe",
+        {
+            "url": url,
+            "language": args.get("language_code", "auto"),
+            "word_timestamps": bool(args.get("word_timestamps")),
+            "words_for_speakers": by_speaker,
+        },
+    )
     words = transcript.get("chunks") or []
 
     if by_speaker:
@@ -24,23 +29,24 @@ async def _run_stt(args: dict, ctx: ToolContext) -> ToolResult:
         # in the orchestrator, using max total temporal overlap.
         from ..contracts import SpeakerTurn, Word, attribute_speakers, group_by_speaker
 
-        turns_raw = (await _post(ctx, ctx.settings.diarize_url, "/diarize", {"url": url}))
+        turns_raw = await _post(ctx, ctx.settings.diarize_url, "/diarize", {"url": url})
         turns = [SpeakerTurn(t["speaker"], t["start"], t["end"]) for t in turns_raw["turns"]]
         parsed = [
             Word(text=w["text"], start=w["timestamp"][0], end=w["timestamp"][1])
-            for w in words if w.get("timestamp")
+            for w in words
+            if w.get("timestamp")
         ]
         chunks = group_by_speaker(attribute_speakers(parsed, turns, fill_nearest=True))
     else:
-        # Always timed, as interfaze returns them. This was [] unless words were asked
-        # for, which threw away timing the recogniser had already produced.
+        # Always timed, as interfaze returns them, whether or not words were asked for.
         from ..contracts import split_long_chunks
 
         chunks = split_long_chunks(words)
 
-    # {text, chunks}, as interfaze returns it for these requests. language_detected was
-    # an extra key interfaze did not send.
+    # {text, chunks}, as interfaze returns it for these requests: it sends no language_detected.
     return ToolResult(model_facing={"text": transcript.get("text", ""), "chunks": chunks})
+
+
 SPEECH_TO_TEXT = Tool(
     name="stt",
     description="Convert speech to text.",
@@ -52,19 +58,26 @@ SPEECH_TO_TEXT = Tool(
                 "description": "The file reference id or url of the audio to transcribe.",
             },
             "split_by_speaker": {
-                "type": "boolean", "default": False,
-                "description": ("Whether to split the transcript by speaker. Use only when asked "
-                                "to detect or separate speakers."),
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Whether to split the transcript by speaker. Use only when asked "
+                    "to detect or separate speakers."
+                ),
             },
             "language_code": {
-                "type": "string", "default": "auto",
-                "description": ("ISO 639-1 two-letter code. When the prompt names or implies the "
-                                "language, set it (e.g. 'id', 'en', 'zh'); for a list of "
-                                "candidates pick the first. Use 'auto' only when the prompt gives "
-                                "no language information."),
+                "type": "string",
+                "default": "auto",
+                "description": (
+                    "ISO 639-1 two-letter code. When the prompt names or implies the "
+                    "language, set it (e.g. 'id', 'en', 'zh'); for a list of "
+                    "candidates pick the first. Use 'auto' only when the prompt gives "
+                    "no language information."
+                ),
             },
             "word_timestamps": {
-                "type": "boolean", "default": False,
+                "type": "boolean",
+                "default": False,
                 "description": "Include word-level timestamps. Only when explicitly requested.",
             },
         },

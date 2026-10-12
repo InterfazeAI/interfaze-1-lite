@@ -20,8 +20,9 @@ _CONCURRENCY = 8
 _ATTEMPTS = 3
 
 
-async def _translate_chunk(chunk: str, target: str, current: str | None,
-                           ctx: ToolContext, gate: asyncio.Semaphore) -> str:
+async def _translate_chunk(
+    chunk: str, target: str, current: str | None, ctx: ToolContext, gate: asyncio.Semaphore
+) -> str:
     from ..brain import Sampling
 
     system, user = translation.prompts(chunk, target, current)
@@ -31,15 +32,17 @@ async def _translate_chunk(chunk: str, target: str, current: str | None,
         for _ in range(_ATTEMPTS):
             try:
                 reply = await ctx.structured(
-                    messages, translation.SCHEMA,
-                    Sampling(max_tokens=translation.MAX_OUTPUT_TOKENS, temperature=0))
+                    messages,
+                    translation.SCHEMA,
+                    Sampling(max_tokens=translation.MAX_OUTPUT_TOKENS, temperature=0),
+                )
                 if ctx.usage is not None:
                     ctx.usage.prompt_tokens += reply.prompt_tokens
                     ctx.usage.completion_tokens += reply.completion_tokens
                 return str(json.loads(reply.content)["translated_text"]).strip()
             except (json.JSONDecodeError, KeyError, TypeError) as exc:
                 last = exc
-    raise RuntimeError(f"translation did not return a translated_text: {last}")
+    raise RuntimeError(f"translation did not return a translated_text: {last}") from last
 
 
 async def _run_translate(args: dict, ctx: ToolContext) -> ToolResult:
@@ -48,15 +51,24 @@ async def _run_translate(args: dict, ctx: ToolContext) -> ToolResult:
     current = str(args.get("current_language") or "").strip() or None
 
     if not text or (isinstance(text, list) and not all(isinstance(t, str) and t for t in text)):
-        return ToolResult(model_facing={"error": "Text is required",
-                                        "message": "Pass the text to translate as a string or a list of strings."})
+        return ToolResult(
+            model_facing={
+                "error": "Text is required",
+                "message": "Pass the text to translate as a string or a list of strings.",
+            }
+        )
     if current and current == target:
         # interfaze's own validation rule. It is also what stops the model "translating"
         # a passage into the language it is already in.
-        return ToolResult(model_facing={
-            "error": "Source and target language cannot be the same",
-            "message": ("The text is already in the target language, so there is nothing to "
-                        "translate. Do not call translate again; answer the user directly.")})
+        return ToolResult(
+            model_facing={
+                "error": "Source and target language cannot be the same",
+                "message": (
+                    "The text is already in the target language, so there is nothing to "
+                    "translate. Do not call translate again; answer the user directly."
+                ),
+            }
+        )
     if target not in translation.languages():
         return ToolResult(model_facing={"error": translation.unsupported(target)})
 
@@ -75,29 +87,34 @@ async def _run_translate(args: dict, ctx: ToolContext) -> ToolResult:
         gate = asyncio.Semaphore(_CONCURRENCY)
         translated: list[str] = []
         for start in range(0, len(flat), translation.BATCH_SIZE):
-            batch = flat[start:start + translation.BATCH_SIZE]
+            batch = flat[start : start + translation.BATCH_SIZE]
             translated += await asyncio.gather(
-                *(_translate_chunk(c, target, current, ctx, gate) for c in batch))
+                *(_translate_chunk(c, target, current, ctx, gate) for c in batch)
+            )
 
         out: list[str] = []
         cursor = 0
         for count, seps in zip(per_item, separators, strict=True):
-            out.append(translation.stitch(translated[cursor:cursor + count], seps))
+            out.append(translation.stitch(translated[cursor : cursor + count], seps))
             cursor += count
 
-        return ToolResult(model_facing={
-            "translated_text": out if was_array else out[0],
-            "source_language": current or "auto-detected",
-            "target_language": target,
-            "batch_size": len(items),
-            "chunks_processed": len(flat),
-        })
+        return ToolResult(
+            model_facing={
+                "translated_text": out if was_array else out[0],
+                "source_language": current or "auto-detected",
+                "target_language": target,
+                "batch_size": len(items),
+                "chunks_processed": len(flat),
+            }
+        )
     except Exception as exc:
-        return ToolResult(model_facing={
-            "error": str(exc) or type(exc).__name__,
-            "message": "Translation failed. Inspect the error before retrying — do not repeat "
-                       "the same call unchanged.",
-        })
+        return ToolResult(
+            model_facing={
+                "error": str(exc) or type(exc).__name__,
+                "message": "Translation failed. Inspect the error before retrying — do not repeat "
+                "the same call unchanged.",
+            }
+        )
 
 
 TRANSLATE = Tool(
@@ -118,21 +135,27 @@ TRANSLATE = Tool(
                     {"type": "string"},
                     {"type": "array", "items": {"type": "string"}},
                 ],
-                "description": ("The text to translate. Pass a single string of any length, or an "
-                                "array of strings for batch translation. Long text is split and "
-                                "batched internally — pass the full text as-is."),
+                "description": (
+                    "The text to translate. Pass a single string of any length, or an "
+                    "array of strings for batch translation. Long text is split and "
+                    "batched internally — pass the full text as-is."
+                ),
             },
             "target_language": {
                 "type": "string",
-                "description": ("The ISO 639-1 two-letter target language code (e.g., 'es' for "
-                                "Spanish, 'fr' for French, 'ja' for Japanese, 'ar' for Arabic, "
-                                "'zh' for Chinese)."),
+                "description": (
+                    "The ISO 639-1 two-letter target language code (e.g., 'es' for "
+                    "Spanish, 'fr' for French, 'ja' for Japanese, 'ar' for Arabic, "
+                    "'zh' for Chinese)."
+                ),
             },
             "current_language": {
                 "type": "string",
-                "description": ("The ISO 639-1 two-letter code of the language the text is "
-                                "written in now. Required: when it is the same as "
-                                "target_language there is nothing to translate."),
+                "description": (
+                    "The ISO 639-1 two-letter code of the language the text is "
+                    "written in now. Required: when it is the same as "
+                    "target_language there is nothing to translate."
+                ),
             },
         },
         "required": ["text", "target_language", "current_language"],

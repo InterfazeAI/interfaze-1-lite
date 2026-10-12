@@ -1,7 +1,4 @@
-"""What the brain is told: shared by the service and the transformers model.
-
-Both run the same tool loop, so both brief the brain the same way.
-"""
+"""What the brain is told; SYSTEM_PROMPT and NUDGE brief both the service and the transformers model."""
 
 SYSTEM_PROMPT = """You are Interfaze, an AI assistant powered by the interfaze-lite model.
 You are precise and thorough, and capable of using tools to enhance accuracy. When the user
@@ -74,16 +71,15 @@ yours to work out. If the question genuinely does not depend on the file's conte
 as you were going to."""
 
 
-# The tool loop's step budget is spent. Offered no tools, the model still reached for
-# one, and the call stripped from its reply left an empty answer: 23 empty answers in
-# one benchmark run, and a landing demo that forecast nothing after eight failed calls.
+# Ends a tool loop that will not finish; without it the model still called a tool and answered empty.
 OUT_OF_STEPS = """No more tool calls are possible. Answer the user's request now, from the tool results
 above. If a tool failed, say what failed and what the user can do about it. Do not leave the
 answer empty."""
 
-# A tool call cut off at the output token limit: its arguments are whatever was written
-# before the cut, and a 365-row table copied into one arrived as no data at all.
-CUT_OFF_CALL = ("This call was cut off at the output token limit before its arguments were "
-                "complete, so it was not run. Do not copy long data into tool arguments: "
-                "pass a file by file_ref_id, and leave out data that is written in the "
-                "user's message.")
+# Answers a call cut off at the output token limit, whose arguments are only what came before the cut.
+CUT_OFF_CALL = (
+    "This call was cut off at the output token limit before its arguments were "
+    "complete, so it was not run. Do not copy long data into tool arguments: "
+    "pass a file by file_ref_id, and leave out data that is written in the "
+    "user's message."
+)

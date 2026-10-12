@@ -16,23 +16,40 @@ TEXT_CODES = tuple(f"S{i}" for i in range(1, 15))
 IMAGE_CODES = ("S1_IMAGE", "S12_IMAGE", "S15_IMAGE")
 ALL_CODES = (*TEXT_CODES, *IMAGE_CODES)
 
-# Llama Guard 4's category names, which is what interfaze's guard model is prompted with.
-CATEGORIES = {
-    "S1": "Violent Crimes.",
-    "S2": "Non-Violent Crimes.",
-    "S3": "Sex-Related Crimes.",
-    "S4": "Child Sexual Exploitation.",
-    "S5": "Defamation.",
-    "S6": "Specialized Advice.",
-    "S7": "Privacy.",
-    "S8": "Intellectual Property.",
-    "S9": "Indiscriminate Weapons.",
-    "S10": "Hate.",
-    "S11": "Suicide & Self-Harm.",
-    "S12": "Sexual Content.",
-    "S13": "Elections.",
-    "S14": "Code Interpreter Abuse.",
+# The guard model's fixed taxonomy in the contract's codes; S6 and S14 have no source category,
+# Jailbreak has no code. Checked against Aegis 2.0's human labels in evals/guard/guard_bench.py.
+GUARD_CATEGORY_CODES = {
+    "Violent": ("S1", "S9"),
+    "Non-violent Illegal Acts": ("S2",),
+    "Sexual Content or Sexual Acts": ("S3", "S4", "S12"),
+    "PII": ("S7",),
+    "Suicide & Self-Harm": ("S11",),
+    "Unethical Acts": ("S5", "S10"),
+    "Politically Sensitive Topics": ("S13",),
+    "Copyright Violation": ("S8",),
+    "Jailbreak": (),
 }
+
+
+def classifier_verdict(answer: str, p_unsafe: float | None, threshold: float) -> str:
+    """The guard model's answer as the text verdict `verdict` reads: "safe", or "unsafe"
+    with the codes on the next line ("unsafe\nS1,S9").
+
+    `answer` is the model's own "Safety: Unsafe\nCategories: Violent". Unsafe counts at
+    `p_unsafe` >= `threshold`. Controversial counts as safe except for self-harm: the model calls
+    people describing their own distress Controversial, and counting it took Aegis's self-harm
+    prompts flagged S11 from 0.66 to 0.79 without flagging any safe test prompt.
+    """
+    label = re.search(r"Safety:\s*(Safe|Unsafe|Controversial)", answer or "")
+    named = re.search(r"Categories:\s*(.*)", answer or "")
+    categories = [c.strip() for c in named.group(1).split(",")] if named else []
+    if label and label.group(1) == "Controversial" and "Suicide & Self-Harm" in categories:
+        return "unsafe\nS11"
+    if not label or label.group(1) != "Unsafe" or p_unsafe is None or p_unsafe < threshold:
+        return "safe"
+    codes = [code for c in categories for code in GUARD_CATEGORY_CODES.get(c, ())]
+    return "unsafe\n" + ",".join(dict.fromkeys(codes)) if codes else "unsafe"
+
 
 _GUARD_TAG = re.compile(r"<guard>([\s\S]*?)</guard>")
 
@@ -46,21 +63,19 @@ def extract(system_text: str | None) -> tuple[list[str] | None, str | None]:
     if not system_text:
         return None, system_text
     match = _GUARD_TAG.search(system_text)
-    stripped = _GUARD_TAG.sub("", system_text).strip() if match else system_text
-    if not match or not match.group(1).strip():
-        return None, stripped
+    if not match:
+        return None, system_text
+    stripped = _GUARD_TAG.sub("", system_text).strip()
     inner = match.group(1).strip()
+    if not inner:
+        return None, stripped
     if inner.upper() == "ALL":
-        codes = list(ALL_CODES)
-    else:
-        codes = [c.strip().upper() for c in inner.split(",") if c.strip()]
-    return codes, stripped
+        return list(ALL_CODES), stripped
+    return [c.strip().upper() for c in inner.split(",") if c.strip()], stripped
 
 
 def weighed_average(scores: list[float]) -> float:
     """Each score weighted by its own square, as interfaze averages image scores."""
-    if not scores:
-        return 0.0
     squares = sum(s * s for s in scores)
     if squares == 0:
         return 0.0
@@ -89,8 +104,9 @@ def wants_images(codes: list[str]) -> dict[str, bool]:
     return {"nudity": "S12_IMAGE" in codes, "gore": "S1_IMAGE" in codes, "nsfw": "S15_IMAGE" in codes}
 
 
-def verdict(guard_text: str, codes: list[str],
-            images: list[dict[str, Any]] | None = None) -> tuple[bool, str, list[dict[str, Any]]]:
+def verdict(
+    guard_text: str, codes: list[str], images: list[dict[str, Any]] | None = None
+) -> tuple[bool, str, list[dict[str, Any]]]:
     """(is_safe, content if blocked, precontext) exactly as interfaze computes them.
 
     `guard_text` is the text classifier's raw answer ("safe", or "unsafe\\nS1,S10").
@@ -100,25 +116,26 @@ def verdict(guard_text: str, codes: list[str],
     is_safe = True
     text = re.sub(r"[\n,]+", " ", guard_text or "").strip()
     warnings = [w.strip() for w in re.split(r"[\n,]", guard_text or "") if w.strip()]
+    matched_warnings = (
+        [w for w in warnings if w in codes] if codes else [w for w in warnings if w != "unsafe"]
+    )
 
     if text != "safe" and (any(c in warnings for c in codes) or not codes):
         is_safe = False
-        matched = ([w for w in warnings if w in codes] if codes
-                   else [w for w in warnings if w != "unsafe"])
-        text = f"unsafe {' '.join(matched)}".strip()
+        text = f"unsafe {' '.join(matched_warnings)}".strip()
 
-    matched_warnings = ([w for w in warnings if w in codes] if codes
-                        else [w for w in warnings if w != "unsafe"])
     precontext: list[dict[str, Any]] = [
         {"name": "text_guardrail_classifier", "result": "safe" if is_safe else matched_warnings},
     ]
 
     if images:
         checks = wants_images(codes)
-        precontext.append({"name": "image_guardrail_classifier",
-                           "result": images[0] if len(images) == 1 else images})
+        precontext.append(
+            {"name": "image_guardrail_classifier", "result": images[0] if len(images) == 1 else images}
+        )
         flagged = [
-            code for code, key in (("S1_IMAGE", "gore"), ("S12_IMAGE", "nudity"), ("S15_IMAGE", "nsfw"))
+            code
+            for code, key in (("S1_IMAGE", "gore"), ("S12_IMAGE", "nudity"), ("S15_IMAGE", "nsfw"))
             if checks[key] and any(r.get(key) for r in images)
         ]
         if flagged:
@@ -131,12 +148,7 @@ def verdict(guard_text: str, codes: list[str],
 
 
 def extract_from_messages(messages: list[dict]) -> tuple[list[str] | None, list[dict]]:
-    """The requested codes from any system message, and the messages with every directive removed.
-
-    Read from every system turn, in string or array form. Read from one string system
-    prompt only, a `<guard>` sent as a content part, or in a second system message, was
-    forwarded to the model unenforced.
-    """
+    """The first directive's codes from any system turn, and the messages with every directive removed."""
     codes: list[str] | None = None
     out: list[dict] = []
 
@@ -154,11 +166,19 @@ def extract_from_messages(messages: list[dict]) -> tuple[list[str] | None, list[
         elif isinstance(content, str):
             out.append({**message, "content": take(content)})
         elif isinstance(content, list):
-            out.append({**message, "content": [
-                {**part, "text": take(part["text"])}
-                if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)
-                else part
-                for part in content]})
+            out.append(
+                {
+                    **message,
+                    "content": [
+                        {**part, "text": take(part["text"])}
+                        if isinstance(part, dict)
+                        and part.get("type") == "text"
+                        and isinstance(part.get("text"), str)
+                        else part
+                        for part in content
+                    ],
+                }
+            )
         else:
             out.append(message)
     return codes, out

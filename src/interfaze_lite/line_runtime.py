@@ -1,21 +1,16 @@
 """The line detector and layout detector, each engine in a process of its own.
 
-They ran as one engine per thread, and threads share Paddle's oneDNN context, which is
-process-wide. After each run a predictor counts that context's cached objects without
-taking the lock other threads write it under (`OneDNNContext::GetCachedObjectsNumber`,
-reached from `AnalysisPredictor::MkldnnPostReset`), and under concurrent OCR the process
-segfaulted -- taking OCR, speech and diarization down with it until it restarted. A
-process of its own gives each engine its own context, so there is nothing to race; and a
-worker that does crash takes one call with it, which is retried, not the service.
-
-Kept free of torch and of this package's other modules, so the worker processes start
-with nothing but Paddle.
+Threads share Paddle's process-wide oneDNN context, whose cached-object count is read
+unlocked (`OneDNNContext::GetCachedObjectsNumber`); under concurrent OCR that segfaulted
+the whole service. A process per engine has nothing to race, and a crash costs one retried call.
+Kept free of torch and this package's other modules, so workers start with nothing but Paddle.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import functools
 import logging
 import multiprocessing
 import os
@@ -45,14 +40,7 @@ _BUILD_LOCK_PATH = os.path.join(tempfile.gettempdir(), "interfaze-line-runtime.l
 
 @contextlib.contextmanager
 def _build_lock():
-    """One engine build at a time, across every worker process.
-
-    A fresh container has no Paddle models on disk, and building an engine downloads
-    and unpacks them into one shared directory. Workers building at once read each
-    other's half-written model folders -- `inference.yml` not found -- and the OCR
-    request failed. One thread-safe build lock covered this when engines lived in
-    threads of one process; processes need a lock on the filesystem.
-    """
+    """One engine build at a time across workers: first builds unpacking at once read half-written models."""
     if fcntl is None:
         yield
         return
@@ -82,18 +70,19 @@ def _engine(kind: str):
 
 
 def _dropping_on_failure(kind: str):
-    """An engine that raised is not reused: a predictor that aborted with
-    `RuntimeError: std::exception` (upstream PaddleOCR #16238) stays broken, and this
-    worker would keep it for its whole life. The next call builds a fresh one."""
+    """Drop an engine that raised; an aborted predictor stays broken (PaddleOCR #16238)."""
+
     def wrap(fn):
+        @functools.wraps(fn)
         def run(*args):
             try:
                 return fn(*args)
             except Exception:
                 _ENGINES.pop(kind, None)
                 raise
-        run.__name__, run.__qualname__, run.__doc__ = fn.__name__, fn.__qualname__, fn.__doc__
+
         return run
+
     return wrap
 
 
@@ -148,11 +137,13 @@ class Runtime:
     def _current(self) -> concurrent.futures.ProcessPoolExecutor:
         with self._lock:
             if self._pool is None:
-                # spawn, not fork: the parent may already hold a CUDA context, which a
-                # forked child inherits broken.
+                # spawn, not fork: a forked child inherits the parent's CUDA context broken.
                 self._pool = concurrent.futures.ProcessPoolExecutor(
-                    max_workers=self._workers, mp_context=multiprocessing.get_context("spawn"),
-                    initializer=_init, initargs=self._init_args)
+                    max_workers=self._workers,
+                    mp_context=multiprocessing.get_context("spawn"),
+                    initializer=_init,
+                    initargs=self._init_args,
+                )
             return self._pool
 
     def _replace(self, broken: concurrent.futures.ProcessPoolExecutor) -> None:

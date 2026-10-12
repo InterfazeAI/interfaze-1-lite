@@ -1,13 +1,13 @@
 """A PDF's pages as images, for the tools that only see images.
 
-Detection runs on an image. Asked to find a figure or an item in a PDF, the tool used to
-fail on the document itself -- the grounding step cannot decode a PDF -- so the request
-could not be answered at all. Each page is rendered and searched as an image instead.
+The grounding step behind detection cannot decode a PDF, so each page is rendered and
+searched as an image.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import tempfile
 from dataclasses import dataclass
@@ -99,7 +99,5 @@ async def pdf_pages(url: str, ctx: ToolContext, page_range: list[int] | None = N
 
 def cleanup(pages: list[Page]) -> None:
     for page in pages:
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(page.path)
-        except OSError:
-            pass

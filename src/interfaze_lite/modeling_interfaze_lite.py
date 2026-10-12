@@ -1,11 +1,11 @@
 """Interfaze Lite -- a composite perception + routing model for `transformers`.
 
     from transformers import AutoModel
-    model = AutoModel.from_pretrained("InterfazeAI/interfaze-lite", trust_remote_code=True)
+    model = AutoModel.from_pretrained("interfaze-ai/interfaze-1-lite", trust_remote_code=True)
 
     model.ocr("invoice.png")                       # sections, lines, words, bounds, confidence
     model.transcribe("call.wav", by_speaker=True)  # speaker-attributed transcript
-    model.detect("street.jpg", ["car", "dog"])     # boxes + masks + labels
+    model.detect("street.jpg", ["car", "dog"])     # labels, boxes, outlines; masks when asked
     model.ground("screen.png", ["the save button"])
     model.chat([{"role": "user", "content": "what does this say?"}], files=["scan.pdf"])
 
@@ -41,9 +41,8 @@ from typing import Any
 import torch
 from transformers import PreTrainedModel
 
-# trust_remote_code ships a sibling file only when a `from .module import name` line names
-# it; `from . import module` is not recognised, and the file never reaches the user. So each
-# sibling is imported by name at least once.
+# trust_remote_code ships a sibling only when a `from .module import name` line names it
+# (`from . import module` is not recognised), so each sibling is imported by name once.
 try:  # the interfaze_lite package, and this repo as trust_remote_code imports it
     from . import contracts, forecasting, grounding
     from .agent import run as run_agent
@@ -52,7 +51,7 @@ try:  # the interfaze_lite package, and this repo as trust_remote_code imports i
     from .forecasting import MAX_CONTEXT, MAX_HORIZON
     from .grounding import MAX_TOKENS as GROUND_MAX_TOKENS
     from .grounding import MAX_TOKENS_UI as GROUND_MAX_TOKENS_UI
-    from .guard import CATEGORIES as GUARD_CATEGORIES
+    from .guard import classifier_verdict
     from .line_runtime import Runtime, layout_pages, line_rows
     from .prompts import NUDGE
 except ImportError:  # the files run flat, from a checkout
@@ -65,24 +64,13 @@ except ImportError:  # the files run flat, from a checkout
     from forecasting import MAX_CONTEXT, MAX_HORIZON  # type: ignore
     from grounding import MAX_TOKENS as GROUND_MAX_TOKENS  # type: ignore
     from grounding import MAX_TOKENS_UI as GROUND_MAX_TOKENS_UI  # type: ignore
-    from guard import CATEGORIES as GUARD_CATEGORIES  # type: ignore
+    from guard import classifier_verdict  # type: ignore
     from line_runtime import Runtime, layout_pages, line_rows  # type: ignore
     from prompts import NUDGE  # type: ignore
 
 
-# Some CDNs -- Wikimedia most notably -- reject requests with no User-Agent and return
-# an HTML error page with a 200. PIL then fails with the useless "cannot identify image
-# file <BytesIO object>", which says nothing about the actual cause.
-
-
 def _hf_token() -> str | None:
-    """The token, under whichever name the environment happens to use.
-
-    Some upstream components are gated. huggingface_hub picks up
-    HF_TOKEN automatically, but a Modal secret may expose it under a different name, and
-    a silent None turns into "You are trying to access a gated repo" at first inference
-    rather than at boot.
-    """
+    """The HF token under whichever name the environment uses, mirrored to HF_TOKEN for gated components."""
     for key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN", "hf_token"):
         value = os.environ.get(key)
         if value:
@@ -95,10 +83,8 @@ def _fast_asr_enabled() -> bool:
     return os.environ.get("ENABLE_FAST_ASR", "0") not in ("0", "", "false", "False")
 
 
-# The recogniser's own defences against hallucinated repetition, as in its reference
-# decoder: a window whose text compresses too well (a loop) or scores too low is
-# re-decoded at a higher temperature. Greedy decoding alone looped "5-5-5" for 60 s
-# of a card number; with these the same audio came back digit-for-digit.
+# The reference decoder's repetition guards: a window that compresses like a loop or scores
+# too low is re-decoded hotter. Greedy alone looped "5-5-5" for 60 s of a card number.
 _RECOGNISER_GUARDS = {
     "condition_on_prev_tokens": False,
     "compression_ratio_threshold": 1.35,
@@ -115,6 +101,11 @@ def _language_code(detected: str | None) -> str | None:
     from transformers.models.whisper.tokenization_whisper import TO_LANGUAGE_CODE
 
     return TO_LANGUAGE_CODE.get(detected.lower(), detected)
+
+
+def _explicit_language(language: str | None) -> str | None:
+    """The caller's language when they named one; None for "" or "auto"."""
+    return language if language and language != "auto" else None
 
 
 def _segments(words: list) -> list:
@@ -145,6 +136,7 @@ def _load_image(src: str | bytes | Any):
     if isinstance(src, (bytes, bytearray)):
         data, origin = bytes(src), "<bytes>"
     elif isinstance(src, str) and src.startswith(("http://", "https://")):
+        # Some CDNs (Wikimedia) answer a missing User-Agent with an HTML page and a 200.
         resp = contracts.fetch_url(src, timeout=60, headers={"User-Agent": contracts.UA, "Accept": "image/*"})
         ctype = resp.headers.get("content-type", "")
         if ctype and not ctype.startswith("image/"):
@@ -164,38 +156,27 @@ def _load_image(src: str | bytes | Any):
 
 class InterfazeLiteModel(PreTrainedModel):
     config_class = InterfazeLiteConfig
-    # Components are self-contained checkpoints with their own init; there is no
-    # top-level parameter tensor for transformers to initialise.
-    _no_split_modules: list[str] = []
+    _no_split_modules: list[str] = []  # No top-level parameters: each component is its own checkpoint.
     supports_gradient_checkpointing = False
 
     def __init__(self, config: InterfazeLiteConfig):
         super().__init__(config)
-        self.config = config
         self._cache: dict[str, Any] = {}
-        # Components are materialised lazily and pages are OCR'd on several threads, so
-        # two pages can race to build the same one. Double-loading the line detector or a 9B VLM
-        # is expensive and can OOM.
-        self._cache_lock = __import__("threading").Lock()
-        # The line and layout detectors run in worker processes (line_runtime): as
-        # threads they shared Paddle's process-wide oneDNN context, raced on it, and
-        # segfaulted the whole perception process under concurrent OCR.
+        # Pages are OCR'd on several threads and can race to build one component; a double load can OOM.
+        self._cache_lock = threading.Lock()
+        # Detectors run in worker processes (line_runtime): as threads they raced on Paddle's
+        # process-wide oneDNN context and segfaulted the perception process.
         self._runtime: Runtime | None = None
         self._runtime_lock = threading.Lock()
 
         self._dtype = (
             getattr(torch, config.torch_dtype) if isinstance(config.torch_dtype, str) else config.torch_dtype
         )
-        # This model owns no parameters -- every tensor belongs to a lazily loaded
-        # component -- so PreTrainedModel.device raises StopIteration. Resolve the
-        # device once, explicitly, and never touch the inherited property.
+        # No parameters, so the inherited PreTrainedModel.device raises StopIteration (see `device`).
         self._torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # PyTorch's cuDNN attention backend crashes on some head-dim/sequence shapes with
-        #   "Expected mha_graph.execute(...).is_good() to be true, but got false"
-        # which is what the document reader's the brain attention hit on this GPU. Turning that one
-        # backend off leaves flash and mem-efficient SDPA available, so this costs
-        # nothing measurable while removing the crash.
+        # cuDNN SDPA crashed the document reader on some shapes ("Expected mha_graph.execute(...)
+        # .is_good()"); flash and mem-efficient SDPA stay available.
         if torch.cuda.is_available() and hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
             torch.backends.cuda.enable_cudnn_sdp(False)
         if not config.lazy_load:
@@ -215,11 +196,10 @@ class InterfazeLiteModel(PreTrainedModel):
         revision: str | None = None,
         **kwargs,
     ):
-        """Build the model from its config alone.
+        """Build the model from its config alone; components download on first use.
 
-        It owns no tensors: every weight belongs to a component in its own folder, loaded
-        on first use. The stock loader looks for a weights file at the repo root, finds
-        none, and raises.
+        Keyword arguments naming a config attribute override it. The stock loader would look
+        for weights at the repo root, find none, and raise.
         """
         if config is None:
             config = cls.config_class.from_pretrained(
@@ -254,16 +234,8 @@ class InterfazeLiteModel(PreTrainedModel):
         """Override PreTrainedModel.device, which assumes the module owns parameters."""
         return self._torch_device
 
-    # ------------------------------------------------------------------ loading
-
     def _repo(self, name: str) -> str:
-        """Where a component's weights live: this repo's `name/` folder when bundled,
-        its upstream checkpoint otherwise.
-
-        Bundled weights come down one component at a time, when it is first used, so an
-        OCR-only caller never downloads the 28 GB brain. A local checkout is read in place.
-        Joining the folder onto a Hub id ("org/repo/brain") only ever worked locally.
-        """
+        """This repo's `name/` folder when bundled, fetched alone on first use; else upstream's."""
         if not self.config.bundle_weights:
             return self.config.component(name)
         root = self.name_or_path or ""
@@ -271,7 +243,7 @@ class InterfazeLiteModel(PreTrainedModel):
             return os.path.join(root, name)
         from huggingface_hub import snapshot_download
 
-        local = snapshot_download(
+        local = snapshot_download(  # A Hub id joined with the folder ("org/repo/brain") is no path.
             root,
             allow_patterns=[f"{name}/*"],
             token=getattr(self, "_hub_token", None) or _hf_token(),
@@ -284,19 +256,15 @@ class InterfazeLiteModel(PreTrainedModel):
         if cached is not None:
             return cached
         with self._cache_lock:
-            # Re-check inside the lock: another thread may have loaded it while we waited.
             if name not in self._cache:
                 self._cache[name] = getattr(self, f"_load_{name}")()
             return self._cache[name]
 
     def _load_brain(self):
-        """The brain, image-capable: it grounds boxes and reads attached images, which
-        a text-only auto class would reject.
+        """The brain, image-capable (it grounds boxes and reads images), FP8 weights dequantized on load.
 
-        Its FP8 weights are dequantized as they load. Run through transformers' FP8
-        kernels they computed nonsense -- a receipt question was answered in looping
-        tokens from four scripts -- where the same weights serve correctly on vLLM.
-        Dequantized, they compute in bf16: exact, for about 54 GB of memory.
+        Transformers' FP8 kernels computed nonsense from weights vLLM serves correctly (looping
+        tokens from four scripts); dequantized they compute in bf16, exact, for about 54 GB.
         """
         from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
 
@@ -323,11 +291,9 @@ class InterfazeLiteModel(PreTrainedModel):
         }
 
     def _load_segmenter(self):
-        """the segmenter, box-prompted.
+        """The box-prompted segmenter, its pip loader patched to load with assign=True.
 
-        The pip loader is patched to load with assign=True: under torch 2.5+ the plain
-        path leaves meta tensors and the predictor produces empty masks. The
-        detection service carries the same patch.
+        Under torch 2.5+ the plain path leaves meta tensors and the predictor produces empty masks.
         """
         import logging
 
@@ -345,8 +311,7 @@ class InterfazeLiteModel(PreTrainedModel):
         build_sam._load_checkpoint = patched
         try:
             if self.config.bundle_weights:
-                # Bundled: the architecture file and checkpoint both sit in this repo,
-                # and are built the way build_sam2 builds them from the package's own.
+                # Bundled: this repo's config.yaml and model.pt, built as build_sam2 builds its own.
                 from hydra.utils import instantiate
                 from omegaconf import OmegaConf
 
@@ -368,43 +333,62 @@ class InterfazeLiteModel(PreTrainedModel):
         return predictor
 
     def _load_ocr_vlm(self):
-        """Load the document VLM with an image-capable auto class.
+        """The document VLM via AutoModelForCausalLM, the one auto class its remote code maps.
 
-        AutoModelForCausalLM resolves to a text-only wrapper for these checkpoints. Its
-        forward() then rejects `pixel_values` and `mm_token_type_ids`, and never sets
-        `cache_position`, which the custom modeling code indexes into -- the two
-        unrelated-looking errors we chased. AutoModelForImageTextToText is the correct
-        class for the document reader and an alternative document model alike.
+        That class is the full vision-language model here; AutoModelForImageTextToText refuses its config.
         """
-        from transformers import AutoProcessor
+        import inspect
+        import types
 
-        try:
-            from transformers import AutoModelForImageTextToText as AutoVLM
-        except ImportError:  # older transformers
-            from transformers import AutoModelForVision2Seq as AutoVLM
+        from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, GenerationMixin
 
         repo = self._repo("ocr_vlm")
         token = _hf_token()
-        return {
-            "model": AutoVLM.from_pretrained(
+        # Explicit, so a transformers default cannot reintroduce a backend this checkpoint breaks on.
+        attn = os.environ.get("OCR_ATTN_IMPL", "sdpa")
+        config = AutoConfig.from_pretrained(repo, trust_remote_code=True, token=token)
+        # The vision tower reads its own config, which ships flash_attention_2 whatever the model says.
+        config.vision_config.attn_implementation = attn
+        if attn != "flash_attention_2":
+            _stand_in_for_flash_attn()
+        model = (
+            AutoModelForCausalLM.from_pretrained(
                 repo,
+                config=config,
                 torch_dtype=self._dtype,
                 trust_remote_code=True,
                 token=token,
-                # Explicit, so a transformers default change cannot silently reintroduce
-                # a backend this checkpoint does not survive.
-                attn_implementation=os.environ.get("OCR_ATTN_IMPL", "sdpa"),
+                attn_implementation=attn,
             )
             .to(self._torch_device)
-            .eval(),
+            .eval()
+        )
+        # Vision rotary frequencies are a non-persistent buffer, so transformers 5's meta-device
+        # load left them zero and the reader described pages instead of reading them. Recomputed
+        # as the module does (theta 10000).
+        for module in model.vision_tower.modules():
+            if type(module).__name__ == "VisionRotaryEmbedding":
+                dim = module.inv_freq.numel() * 2
+                steps = torch.arange(0, dim, 2, dtype=torch.float, device=module.inv_freq.device)
+                module.inv_freq = 1.0 / (10000.0 ** (steps / dim))
+        # Its prepare_inputs_for_generation indexes cache_position, which transformers 5 no longer
+        # passes; from the release with `is_first_iteration`, the inherited one sends the image.
+        if (
+            "is_first_iteration"
+            in inspect.signature(GenerationMixin.prepare_inputs_for_generation).parameters
+        ):
+            model.prepare_inputs_for_generation = types.MethodType(
+                GenerationMixin.prepare_inputs_for_generation, model
+            )
+        return {
+            "model": model,
             "processor": AutoProcessor.from_pretrained(repo, trust_remote_code=True, token=token),
         }
 
     def _line_detector_settings(self) -> dict:
         """How each worker builds its line detector: detection + recognition, on CPU.
 
-        The GPU build conflicts with torch/vLLM's CUDA runtime, and detection is cheap
-        enough on CPU that this costs about a second.
+        The GPU build conflicts with torch/vLLM's CUDA runtime; CPU costs about a second.
         """
         settings = {
             "lang": "en",
@@ -412,14 +396,11 @@ class InterfazeLiteModel(PreTrainedModel):
             "use_doc_orientation_classify": False,
             "use_doc_unwarping": False,
             "use_textline_orientation": False,
-            # Several workers run at once; each takes its share of the cores instead
-            # of all of them, which oversubscribed the CPU.
+            # Each concurrent worker takes its share of the cores; all of them oversubscribed the CPU.
             "cpu_threads": max(1, (os.cpu_count() or 8) // max(1, self.config.line_detector_pool_size)),
         }
         if self.config.bundle_weights:
-            # Read from this repo, each under the name saved with it: given only a
-            # folder, PaddleOCR assumes its own default recogniser and refuses the one it
-            # finds ("Model name mismatch").
+            # Named as saved: given a bare folder, PaddleOCR assumes its default ("Model name mismatch").
             detector, recognizer = self._repo("line_detector"), self._repo("line_recognizer")
             settings |= {
                 "text_detection_model_name": _paddle_name(detector),
@@ -432,9 +413,7 @@ class InterfazeLiteModel(PreTrainedModel):
     def _layout_settings(self) -> dict | None:
         """How each worker builds its layout detector, or None when there is none.
 
-        Classifying a page into titles, paragraphs, tables and figures is a closed-set
-        detection problem: a small CPU detector answers it in milliseconds where a
-        structured generation costs a full decode.
+        A small CPU detector types a page's blocks in milliseconds; a structured generation took ~60 s.
         """
         if self.config.bundle_weights:
             folder = self._repo("layout")
@@ -443,12 +422,8 @@ class InterfazeLiteModel(PreTrainedModel):
         return {"model_name": name} if name else None
 
     def _load_asr(self):
-        # the fast recogniser's toolkit, not transformers. Kept behind the same accessor so callers cannot tell.
-        # The toolkit is a heavy optional dependency; when it is absent every request
-        # routes to the speech recogniser instead of failing, which is a real degradation but a
-        # working one.
-        # Optional, and imported inside `try` so trust_remote_code's import check -- which
-        # demands every package the file names -- does not make it a requirement.
+        # Optional: imported inside `try` so trust_remote_code's import check does not require it.
+        # Absent, _transcribe_fast falls back to the speech recogniser.
         try:
             import nemo.collections.asr as nemo_asr
         except ImportError as exc:
@@ -457,15 +432,10 @@ class InterfazeLiteModel(PreTrainedModel):
         return nemo_asr.models.ASRModel.from_pretrained(self.config.component("asr"))
 
     def _load_asr_fallback(self):
-        """the speech recogniser, placed by accelerate rather than moved afterwards.
+        """The speech recogniser, placed by `device_map` rather than moved afterwards.
 
-        the speech recogniser ties `proj_out` to the decoder embeddings, so it is absent from the
-        checkpoint and transformers newly-initialises it -- on the meta device. A
-        later `.to(device)` then dies on that one tensor with "Cannot copy out of meta
-        tensor; no data!", which the service reported as a bare 501 and which made
-        every transcription fail. It depends on load order, so it reproduces
-        intermittently and reads as flakiness. `device_map` materialises tied and
-        untied parameters alike, and never calls .to() on a meta tensor.
+        Its tied `proj_out` is absent from the checkpoint and initialised on meta, so a later
+        `.to(device)` failed every transcription ("Cannot copy out of meta tensor"), intermittently.
         """
         from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 
@@ -482,28 +452,22 @@ class InterfazeLiteModel(PreTrainedModel):
             model=model,
             tokenizer=processor.tokenizer,
             feature_extractor=processor.feature_extractor,
-            # No chunk_length_s: audio past 30 s goes through the recogniser's own
-            # sequential long-form decoding, window by window, which is what makes the
-            # repetition guards in _RECOGNISER_GUARDS available and bounds memory per
-            # window. Pipeline chunking stitched overlapping windows instead: on a
-            # 104 s support call it looped "5-5-5" through a card number, glued words
-            # at the seams ("websitesince"), and broke word alignment outright.
-            # Measured on the H100: segments 2.6 s / 1.9 GiB peak, words 10.2 s / 4.8 GiB.
+            # No chunk_length_s: the recogniser's own long-form decode enables _RECOGNISER_GUARDS and
+            # bounds memory per window. Pipeline chunking looped "5-5-5" through a card number,
+            # glued words at the seams ("websitesince") and broke word alignment.
             batch_size=1,
         )
 
     def _load_diarizer(self):
-        # the diarization library Pipeline -- not a PreTrainedModel, so it is wrapped rather than
-        # subclassed. Weights are gated: an anonymous fetch returns 401, so HF_TOKEN must
-        # be set in the environment or passed to from_pretrained.
+        # Gated upstream: an anonymous fetch is a 401, so HF_TOKEN must be set (see _hf_token).
         from pyannote.audio import Pipeline
 
         pipeline = Pipeline.from_pretrained(self._repo("diarizer"), token=_hf_token())
         return pipeline.to(self._torch_device)
 
     def _load_guard(self):
-        """The text guard: a safety classifier answering "safe", or "unsafe" and the
-        violated categories, prompted with the S1-S14 taxonomy interfaze's guard uses."""
+        """The text guard: a safety classifier answering Safe, Controversial or Unsafe and
+        its own categories, which guard.classifier_verdict translates to S1-S14."""
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         repo = self._repo("guard")
@@ -516,15 +480,11 @@ class InterfazeLiteModel(PreTrainedModel):
         }
 
     def _load_forecaster(self):
-        """The time-series model, compiled exactly as JigsawStack's forecast service does:
-        1,024 points of context, a 256-step horizon, flip-invariant, non-negative when
-        the history is."""
+        """The time-series model, compiled exactly as JigsawStack's forecast service compiles it."""
         import timesfm
 
-        # Built in float32 whatever the process default is. TimesFM creates its layers at
-        # the default dtype and feeds them float32, and another component's loader left
-        # the default at bf16: the forecast then failed with "expected mat1 and mat2 to
-        # have the same dtype" depending only on which model happened to load first.
+        # Built in float32: TimesFM feeds float32 to layers made at the default dtype, which another
+        # loader can leave at bf16 ("expected mat1 and mat2 to have the same dtype").
         previous = torch.get_default_dtype()
         torch.set_default_dtype(torch.float32)
         try:
@@ -547,59 +507,51 @@ class InterfazeLiteModel(PreTrainedModel):
         )
         return model
 
-    # ---------------------------------------------------------------- guardrails
-
-    # Longer text is classified by its last this-many characters: a prompt of tens of
-    # thousands of tokens is prefilled in one pass here, on a card other models share.
-    _GUARD_MAX_CHARS = 64_000
+    _GUARD_MAX_CHARS = 64_000  # Longer text is judged by its tail: it prefills in one pass on a shared card.
 
     @torch.inference_mode()
     def moderate(self, text: str) -> dict:
-        """The guard's verdict on one user message: `output` is its raw answer, "safe" or
-        "unsafe" followed by a comma-separated list of codes on the next line."""
+        """The guard's verdict on one user message: `output` is "safe", or "unsafe"
+        followed by a comma-separated list of codes on the next line."""
         guard = self._component("guard")
         tokenizer, model = guard["tokenizer"], guard["model"]
-        conversation = [
-            {"role": "user", "content": [{"type": "text", "text": (text or "")[-self._GUARD_MAX_CHARS :]}]}
-        ]
-        encoded = tokenizer.apply_chat_template(
-            conversation,
-            categories=GUARD_CATEGORIES,
-            excluded_category_keys=[],
-            return_tensors="pt",
-            return_dict=True,
+        # Its template concatenates message.content, so the text goes in as a string, and
+        # writes the assistant turn's opening itself.
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": (text or "")[-self._GUARD_MAX_CHARS :]}], tokenize=False
         )
-        inputs = {k: v.to(model.device) for k, v in encoded.items()}
+        inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(model.device)
         prompt_len = inputs["input_ids"].shape[1]
         out = model.generate(
-            **inputs, max_new_tokens=20, do_sample=False, pad_token_id=tokenizer.eos_token_id,
-            output_scores=True, return_dict_in_generate=True,
+            **inputs,
+            max_new_tokens=32,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+            output_scores=True,
+            return_dict_in_generate=True,
         )
         generated = out.sequences[0, prompt_len:]
         answer = tokenizer.decode(generated, skip_special_tokens=True).strip()
 
-        # Unsafe only when the guard is sure. Its verdict is the likelier of "safe" and
-        # "unsafe", and plain file requests -- "Extract all text", "Transcribe this audio
-        # file" -- came out unsafe S8 at 0.59-0.73, blocking OCR under a guard. Every real
-        # violation tested scored 0.986 or more, every safe prompt 0.014 or less; thresholding
-        # this probability is how the guard is meant to be calibrated.
-        safe, unsafe = (tokenizer.encode(w, add_special_tokens=False)[0] for w in ("safe", "unsafe"))
+        # P(Unsafe) over the three labels at the verdict token. Thresholding it, not taking
+        # the likeliest label, is how the guard is calibrated (see _GUARD_UNSAFE_THRESHOLD).
+        labels = [
+            tokenizer.encode(" " + w, add_special_tokens=False)[0]
+            for w in ("Safe", "Unsafe", "Controversial")
+        ]
         p_unsafe = None
         for step, token in enumerate(generated.tolist()):
-            if token in (safe, unsafe):
-                probs = torch.softmax(out.scores[step][0].float(), dim=-1)
-                p_unsafe = float(probs[unsafe] / (probs[unsafe] + probs[safe]))
+            if token in labels:
+                probs = torch.softmax(out.scores[step][0].float(), dim=-1)[labels]
+                p_unsafe = float(probs[1] / probs.sum())
                 break
-        if answer.startswith("unsafe") and p_unsafe is not None and p_unsafe < _GUARD_UNSAFE_THRESHOLD:
-            answer = "safe"
+        answer = classifier_verdict(answer, p_unsafe, _GUARD_UNSAFE_THRESHOLD)
         return {
             "output": answer,
             "unsafe_probability": p_unsafe,
             "prompt_tokens": int(prompt_len),
             "completion_tokens": int(generated.shape[0]),
         }
-
-    # ---------------------------------------------------------------- forecasting
 
     @torch.inference_mode()
     def forecast(self, y: dict, horizon: int) -> dict:
@@ -630,8 +582,6 @@ class InterfazeLiteModel(PreTrainedModel):
             else [round(float(p), 4) for p in preds]
         )
         return {"timestamp": forecasting.future_timestamps(dts[-1], horizon, step), "value": preds}
-
-    # ---------------------------------------------------------------- detection
 
     @torch.inference_mode()
     def detect(self, image, prompts: Sequence[str], *, return_masks: bool = False) -> dict:
@@ -675,22 +625,14 @@ class InterfazeLiteModel(PreTrainedModel):
         return {"detected_objects": objects, "width": source.width, "height": source.height}
 
     def _fit_for_ocr(self, image):
-        """Load and bound an image exactly as the OCR and detect paths do.
-
-        Shared so a caller that grounded boxes elsewhere segments against the SAME
-        pixel grid those boxes were measured on.
-        """
+        """The image as the OCR path bounds it (`ocr_max_pixels`): the grid /segment cuts
+        masks on, whatever budget the boxes were grounded at."""
         return _fit_pixels(_load_image(image), self.config.ocr_max_pixels)
 
     def _segment_boxes_with_outlines(
         self, img, boxes: list[list[int]]
     ) -> tuple[list[str], list[list | None]]:
-        """Masks and their outlines, from one segmentation pass.
-
-        The outline is traced from the boolean array the segmenter returns, not from
-        the PNG: encoding and decoding it again only to find its edge would be work
-        for nothing when the array is right here.
-        """
+        """Masks and their outlines, from one segmentation pass."""
         import numpy as np
 
         predictor = self._component("segmenter")
@@ -712,20 +654,14 @@ class InterfazeLiteModel(PreTrainedModel):
         masks = masks.astype(bool)
         return ([_encode_mask_array(m) for m in masks], [_outline_of(m) for m in masks])
 
-    # ---------------------------------------------------------------------- OCR
-
     @torch.inference_mode()
     def ocr(self, source, *, return_markdown: bool = False, page_range: list[int] | None = None) -> dict:
-        """OCR an image, a PDF, or a .docx.
+        """OCR an image or a PDF; a .docx or plain-text file is read as text, without boxes.
 
-        PDFs are rendered page by page and the results concatenated into one document,
-        matching the published contract: `sections` flattened across pages, `height`
-        summed, `width` the widest page, and per-page bounds offset by the cumulative
-        height so every box is addressable in one stacked coordinate space.
-
-        .docx already contains text, so it is read rather than rasterised -- running OCR
-        over a re-rendered Word file would only add recognition errors to text we
-        already have exactly.
+        PDFs are rendered page by page and concatenated, matching the published contract:
+        `sections` flattened across pages, `height` summed, `width` the widest page, and bounds
+        left page-local, each section stamped with its page and that page's frame. `page_range`
+        is 1-based inclusive and clamped; at most `config.max_pdf_pages` pages are read.
         """
         kind = contracts.document_kind(source)
         if kind == "pdf":
@@ -738,6 +674,7 @@ class InterfazeLiteModel(PreTrainedModel):
 
     def _ocr_pdf(self, source, *, return_markdown: bool, page_range) -> dict:
         import pymupdf  # `fitz` is the deprecated alias
+        from PIL import Image
 
         data = contracts.fetch_bytes(source)
         with pymupdf.open(stream=data, filetype="pdf") as doc:
@@ -751,9 +688,7 @@ class InterfazeLiteModel(PreTrainedModel):
                 if first > last:
                     first, last = last, first
 
-            # A 77-page paper OCRs every page at 1-2s each and then blows the request
-            # deadline, which is a worse outcome than answering from the first N: the
-            # caller gets nothing at all. Cap it and say so.
+            # Capped: all 77 pages of a paper blew the request deadline and returned nothing.
             capped = min(last, first - 1 + self.config.max_pdf_pages)
 
             pages, frames = [], []
@@ -767,39 +702,24 @@ class InterfazeLiteModel(PreTrainedModel):
                     max_pixels=self.config.ocr_max_pixels,
                     small_pixels=self.config.ocr_upscale_below_pixels,
                 )
-                pages.append(_pixmap_to_image(page.get_pixmap(dpi=dpi)))
+                pixmap = page.get_pixmap(dpi=dpi)
+                pages.append(Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples))
                 # Boxes are reported at interfaze's render scale whatever the read used:
                 # a client draws them on the page rendered at that scale.
                 scale = self.config.pdf_frame_dpi / 72.0
                 frames.append((round(rect.width * scale), round(rect.height * scale)))
 
-        # Both stages run across pages concurrently, for different reasons.
-        #
-        # Line detection runs in the detector worker processes (line_runtime), one
-        # engine each, so the pages genuinely overlap. This loop used to be serial,
-        # which on a 50-page document was ~2s a page of wall-clock that nothing else
-        # was waiting on.
-        #
-        # The VLM calls are HTTP to a vLLM server with continuous batching, so N pages
-        # in flight cost barely more than one.
+        fitted = [_fit_pixels(page, self.config.ocr_max_pixels) for page in pages]
 
-        fitted = [_fit_pixels(_load_image(page), self.config.ocr_max_pixels) for page in pages]
-
-        # Both stages in flight together, not one phase after the other. They compete
-        # for different things -- line detection for CPU, the VLM for a socket and the GPU
-        # behind it -- so a barrier between them only adds their durations: 9.0s and
-        # 8.5s measured separately on one page, against 9.0s if they overlap.
-        #
-        # submit(), not map(): map blocks until its whole iterable is done, so
-        # scheduling detection with it and then reading is exactly the barrier this
-        # is meant to remove. Futures let both queues drain at once.
+        # Line detection (worker processes) and the read (HTTP to a continuously batching vLLM)
+        # run across pages and alongside each other: they compete for different things, so a
+        # barrier only adds their durations (9.0 s + 8.5 s vs 9.0 s overlapped). submit(), not
+        # map(), which is that barrier.
         detect_workers = max(1, min(self.config.line_detector_pool_size, len(fitted)))
         read_workers = max(1, min(self.config.ocr_page_concurrency, len(fitted)))
 
-        # Layout goes in as one job covering every page, not one job per page. It is
-        # the third stage and it is cheap -- a fraction of a second against a VLM read
-        # of several seconds -- so it finishes inside the time the other two already
-        # take, and fanning it out would only take workers from line detection.
+        # One layout job for every page: cheap enough to finish inside the other stages, and
+        # fanned out it would only take workers from line detection.
         def classify_pages() -> list[tuple[list[dict], str]]:
             return [self._detect_layout(img) for img in fitted]
 
@@ -832,10 +752,8 @@ class InterfazeLiteModel(PreTrainedModel):
 
         sections: list[dict] = []
         for offset, result in enumerate(results):
-            # No coordinate translation. interfaze keeps bounds page-local and stamps
-            # each section with its page and that page's frame.
-            # Stacking pages onto one canvas -- which this used to do -- silently moved
-            # every box on every page after the first, with nothing to signal it.
+            # Bounds stay page-local, as interfaze keeps them; stacking pages onto one canvas
+            # moved every box after the first page.
             sections.extend(
                 contracts.backfill_sections(
                     result.get("sections") or [],
@@ -853,9 +771,7 @@ class InterfazeLiteModel(PreTrainedModel):
             "context": page_text if return_markdown else None,
             "sections": sections,
             "has_text": any(r.get("has_text") for r in results),
-            # Max width, summed height: the aggregate shape interfaze reports for
-            # back-compat. It matches no single page, which is exactly why every
-            # section carries its own frame.
+            # interfaze's back-compat aggregate; it matches no page, hence each section's own frame.
             "width": max((r.get("width") or 0) for r in results) if results else 0,
             "height": sum((r.get("height") or 0) for r in results),
             "total_pages": total,
@@ -873,18 +789,13 @@ class InterfazeLiteModel(PreTrainedModel):
         }
 
     def _ocr_image(self, image, *, return_markdown: bool = False) -> dict:
-        """Two-stage OCR: a detector supplies geometry and confidence, a VLM supplies
-        structure.
+        """Two-stage OCR: a detector supplies geometry and confidence, a VLM supplies structure.
 
-        Neither half is sufficient on its own. an alternative document model reconstructs reading order,
-        tables and markdown but emits no confidence at all -- its authors dropped mAP
-        for exactly that reason. The line detector supplies calibrated per-word scores,
-        which `average_confidence` needs so the low-confidence fallback can fire.
+        The reader emits no confidence; the detector's scores feed `_denser_budget` and
+        `contracts.drop_unread`.
         """
-        # Bound resolution here, once, so the detector and the VLM see the SAME image
-        # and therefore agree on a coordinate space. Capping only inside the VLM path
-        # left the line detector chewing a 16.8 MP render on CPU -- 65s instead of 5s -- and the
-        # two halves measuring boxes against different pixel grids.
+        # Bounded once, so detector and VLM share one pixel grid; capped in the VLM path alone,
+        # the detector chewed a 16.8 MP render (65 s, not 5 s) against a different grid.
         source = contracts.enhance_scan(_load_image(image))
         img = _fit_pixels(source, self.config.ocr_max_pixels)
         if source.width * source.height < self.config.ocr_upscale_below_pixels:
@@ -892,18 +803,9 @@ class InterfazeLiteModel(PreTrainedModel):
             # guesses at; twice the pixels and it reads it. Boxes are mapped back below.
             img = _fit_pixels(_upscale(source, 2), self.config.ocr_max_pixels)
 
-        # Timed separately because the two halves have very different cost profiles and
-        # very different fixes: line detection is CPU-bound detection, the VLM is GPU decode.
-        # Guessing which dominates sends you optimising the wrong one.
-        # The two halves contend for nothing: line detection is CPU-only, the document VLM is
-        # an HTTP call to a GPU server, and their outputs stay independent until the
-        # stitch. Run one after the other they simply add -- measured 9.0s + 8.5s on a
-        # single 0.69 MP page, for 17.5s of a 29s request.
-        #
-        # What forced the ordering was `_denser_budget`: it needs the detected line
-        # heights before it can decide a page deserves more pixels, and that decision
-        # changes which image the VLM should read. So both start at the current budget
-        # and the second pass is paid for only when a page actually escalates.
+        # Detection (CPU) and the read (HTTP to a GPU) contend for nothing, so _read_page runs them
+        # together (serially 9.0 s + 8.5 s on a 0.69 MP page). `_denser_budget` needs the line
+        # heights first, so a second pass is paid only when a page escalates.
         t0 = time.perf_counter()
         detector_lines, regions, vlm_markdown, layout, layout_status = self._read_page(img)
         t_page = time.perf_counter() - t0
@@ -915,15 +817,14 @@ class InterfazeLiteModel(PreTrainedModel):
             detector_lines, regions, vlm_markdown, layout, layout_status = self._read_page(img)
             t_page += time.perf_counter() - t0
 
-        # One figure, because the stages overlap now: splitting the wall-clock between
-        # them would imply a division that no longer exists.
+        # One figure: the stages overlap, so splitting the wall-clock between them would
+        # imply a division that does not exist.
         print(
             f"[ocr timing] {img.width}x{img.height} "
             f"detect+vlm(parallel)={t_page:.1f}s "
             f"lines={len(detector_lines)} regions={len(regions)}",
             flush=True,
         )
-        # In the caller's pixels, not the resized copy's.
         return contracts.rescale_page(
             self._assemble(
                 img,
@@ -941,19 +842,13 @@ class InterfazeLiteModel(PreTrainedModel):
         )
 
     def _detect_layout(self, img) -> tuple[list[dict], str]:
-        """Typed blocks for one page: label, score and bounds in the image's frame.
+        """Typed blocks for one page (label, score, bounds in the image's frame) and a status.
 
-        Why the result is inspected so defensively: the detector's output wrapper
-        differs between releases -- a plain dict, a dict under "res", or an object
-        exposing .json -- and an unrecognised shape yields no blocks at all. When that
-        happens the reason is returned alongside the blocks and surfaced in the OCR
-        payload, because a silently empty layout is indistinguishable from a page that
-        genuinely has no regions. Returned rather than stored on the instance: pages are
-        classified concurrently, and one page's outcome must not overwrite another's.
+        The detector's result wrapper differs between releases (a dict, a dict under "res", an
+        object with .json); the status tells an unrecognised shape from an empty page. Returned,
+        not stored, because pages are classified concurrently.
         """
-        # Bundled, the detector is in this repo; otherwise the deployment names it.
-        # Asking the config for a component name alone switched layout off for every
-        # bundled download, whose config names none.
+        # Via _layout_settings: a bundled config names no layout component.
         try:
             if self._layout_settings() is None:
                 return [], "unavailable: no layout component configured"
@@ -1016,10 +911,7 @@ class InterfazeLiteModel(PreTrainedModel):
     def _read_page(self, img):
         """Detect lines, classify layout, and read the document at the same time.
 
-        Three threads: two block on CPU inside line detection, the third on a socket waiting
-        for the VLM server, so none holds the GIL for the part that costs. Layout is
-        independent of the other two, so it is free wall-clock rather than an extra
-        stage.
+        Each thread waits on detector processes or the VLM socket, so none holds the GIL for the costly part.
         """
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
@@ -1031,11 +923,8 @@ class InterfazeLiteModel(PreTrainedModel):
     def _denser_budget(self, source, img, detector_lines):
         """Re-fit the page at the dense budget when the first read looks pixel-starved.
 
-        Two independent signals, because they catch different documents. Short lines
-        mean small type -- a dense paper -- which is where a 1 MP read lost subscripts
-        entirely. Low mean confidence means the recogniser is guessing, which is the
-        degraded-scan case. Either is worth the extra pixels; neither fires on an
-        ordinary page, so the common path keeps the cheaper budget.
+        Short lines mean small type (a 1 MP read lost a paper's subscripts); low mean confidence
+        means a degraded scan. Neither fires on an ordinary page.
         """
         if self.config.ocr_dense_max_pixels <= self.config.ocr_max_pixels:
             return None
@@ -1079,49 +968,38 @@ class InterfazeLiteModel(PreTrainedModel):
     ) -> dict:
         """Stitch one page's detector geometry to its VLM text."""
 
+        regions, vlm_markdown = contracts.restore_marks(regions, vlm_markdown, detector_lines)
+        detector_lines = contracts.drop_unread(
+            regions,
+            detector_lines,
+            self.config.ocr_unread_min_confidence,
+            self.config.ocr_unread_alone_min_confidence,
+        )
         stitched = (
             contracts.stitch(regions, detector_lines)
             if regions
             else contracts.merge_lines_into_sections(detector_lines)
         )
 
-        # ONE SECTION PER PAGE. This is a hard part of the interfaze contract, not a
-        # presentation choice: consumers index `sections[0]` as the page, and derive the
-        # per-page height as `result.height / sections.length` to map page-local
-        # coordinates. Emitting a section per text region made a single page look like
-        # three, so every box was scaled by a third of the real page height and
-        # attributed to the wrong page.
+        # ONE SECTION PER PAGE, by interfaze's contract: consumers index `sections[0]` as the page
+        # and derive page height as `height / sections.length`; a section per region scaled every
+        # box by a third and put it on the wrong page.
         sections = [contracts.collapse_to_page(stitched)] if stitched else []
 
-        # Both of these are the document VLM's own output -- that is the property that
-        # matters, and the one that was broken when detector text could leak in.
-        #
-        # `text` is the COMPLETE document. Building it from regions instead looked
-        # tidier but silently lost content: region extraction only captures text
-        # following a data-bbox attribute, so anything the document reader emits unboxed vanished.
-        # Losing an invoice total to make a substring assertion hold is a bad trade.
+        # `text` is the reader's COMPLETE document; the detector's sure lines stand in only when it
+        # read nothing. Built from regions, it lost whatever was read without a usable box.
         region_text = "\n".join(s.text for s in sections if s.text.strip())
         # Returned by the reader rather than stashed on self: pages are OCR'd
         # concurrently, and instance state would let one page's text overwrite another's.
         markdown = vlm_markdown or region_text
-        if contracts.describes_a_photo(detector_lines, markdown):
-            markdown, region_text, sections = "", "", []
-        text = markdown or region_text
         return {
             "_timing": {"detect_s": round(t_detect, 2), "vlm_s": round(t_vlm, 2)},
-            # `text` is always the VLM's own output and is the single source of truth
-            # for document text. `context` is the markdown rendering of the same thing,
-            # returned only when asked for.
-            "text": text,
+            "text": markdown,
             "context": markdown if return_markdown else None,
             "sections": contracts.backfill_sections(
                 [s.as_dict() for s in sections], page=1, width=img.width, height=img.height
             ),
-            "has_text": bool(text.strip()),
-            # Typed blocks with their own text and bounds, produced by a detector
-            # rather than a structured generation. The caller gets the same three
-            # things it used to -- what kind of block, where it is, what it says --
-            # without a decode per page.
+            "has_text": bool(markdown.strip()),
             "layout": contracts.attach_text_to_layout(
                 layout or [],
                 detector_lines,
@@ -1135,22 +1013,9 @@ class InterfazeLiteModel(PreTrainedModel):
         }
 
     def _detect_text_lines(self, img) -> list[OCRLine]:
-        """the line detector detection + recognition -> lines with quads and confidence.
-
-        the line detector 3.x renamed the entry point (`.ocr(cls=True)` -> `.predict()`), changed
-        the result shape from nested tuples to a dict of parallel lists, and removed
-        `show_log`. Both generations are supported because the installed version depends
-        on the image build and a hard failure here loses the confidence signal that the
-        low-confidence fallback depends on.
-        """
-        # line detection's C++ detector aborts with a bare `RuntimeError: std::exception` on
-        # large inputs, which is what the single 1 MP ingestion cap was really
-        # protecting against. But the two stages do not need the same picture: line detection
-        # only contributes geometry and confidence, while the VLM has to actually read
-        # the glyphs, and starving IT of pixels is what lost subscripts. So detection
-        # runs on a downscaled copy and its boxes are scaled back into the caller's
-        # frame. The frames must still agree at the end -- that is what the stitch
-        # matches on -- so the rescale is arithmetic, not an approximation.
+        """Lines with quads and confidence, from the line detector's detection + recognition."""
+        # The C++ detector aborts (`RuntimeError: std::exception`) on large inputs and supplies only
+        # geometry and confidence, so it reads a downscaled copy whose boxes are scaled back exactly.
         detect_img = _fit_pixels(img, self.config.line_detector_max_pixels)
         scale_x = img.width / detect_img.width
         scale_y = img.height / detect_img.height
@@ -1176,91 +1041,58 @@ class InterfazeLiteModel(PreTrainedModel):
         return lines
 
     def _read_document(self, img) -> tuple[list[contracts.VLMRegion], str]:
-        """Run the configured document VLM: regions in reading order, plus markdown.
+        """Run the document reader: regions in reading order, plus markdown (`contracts.read_layout`)."""
+        # Sent on the reader's own patch grid, so the frame its boxes are measured in is
+        # exactly the image it saw; read_layout scales them back to `img`.
+        sent = _snap_to_grid(img, _DOC_READER_GRID)
+        budget = _token_budget(sent, self.config.ocr_max_new_tokens)
 
-        Two families are supported because they speak different output languages:
-        the document reader emits HTML whose elements carry `data-bbox`, an alternative document model emits a JSON list
-        of (bbox, category, text). Both are reduced to the same VLMRegion here so the
-        stitching step downstream does not care which one ran.
-        """
-        # Chosen by configuration, not by sniffing the component's name. Matching a
-        # substring of the repo id meant renaming anything silently rerouted OCR to
-        # the other reader, which then failed on the first page it was handed.
-        if self.config.ocr_vlm_format == "html":
-            return self._read_document_html(img)
-        return self._read_document_json(img), ""
-
-    def _read_document_html(self, img) -> tuple[list[contracts.VLMRegion], str]:
-        """the document reader -> HTML with data-bbox attributes.
-
-        The prompt comes from the upstream `the document reader-ocr` package when it is installed,
-        because the document reader is fine-tuned against one specific instruction and paraphrasing
-        it degrades output. The literal is a fallback, not an alternative.
-        """
-        try:
-            from chandra.prompts import PROMPT_MAPPING
-
-            prompt = PROMPT_MAPPING["ocr_layout"]
-        except (ImportError, KeyError):
-            prompt = (
-                "Convert this document to HTML. Preserve reading order and layout. "
-                "Give every block a data-bbox attribute."
-            )
-
-        # Served by vLLM when a URL is configured. That is the difference between ~15
-        # tok/s through transformers.generate() -- a bare autoregressive loop -- and
-        # continuous batching with paged attention and CUDA graphs. On this workload it
-        # is the single largest latency lever, and it also removes the 4x run-to-run
-        # variance that comes from having no scheduler.
+        # vLLM when configured: the largest latency lever here, against ~15 tok/s from bare
+        # generate(), and without its 4x run-to-run variance.
         if self.config.ocr_vlm_url:
-            html = self._vlm_via_server(img, prompt)
-            return contracts.parse_vlm_regions(html, img), contracts.vlm_markdown(html)
+            return contracts.read_layout(self._vlm_via_server(sent, budget), sent.size, img)
 
         ocr = self._component("ocr_vlm")
         model, processor = ocr["model"], ocr["processor"]
-
-        # Already bounded by ocr() at ingestion; only the output budget is set here.
-        budget = _token_budget(img, self.config.ocr_max_new_tokens)
-
         messages = [
             {
                 "role": "user",
                 "content": [
-                    {"type": "image", "image": img},
-                    {"type": "text", "text": prompt},
+                    {"type": "image", "image": sent},
+                    {"type": "text", "text": _DOC_READER_PROMPT},
                 ],
             }
         ]
         text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = processor(text=[text], images=[img], return_tensors="pt").to(self._torch_device)
+        inputs = processor(text=[text], images=[sent], return_tensors="pt").to(self._torch_device)
         out = _generate(model, inputs, max_new_tokens=budget, eos_token_id=_stop_ids(model, processor))
-        html = processor.decode(out[0][inputs.input_ids.shape[1] :], skip_special_tokens=True)
+        raw = processor.decode(out[0][inputs.input_ids.shape[1] :], skip_special_tokens=True)
+        return contracts.read_layout(raw, sent.size, img)
 
-        return contracts.parse_vlm_regions(html, img), contracts.vlm_markdown(html)
-
-    def _vlm_via_server(self, img, prompt: str) -> str:
+    def _vlm_via_server(self, img, budget: int) -> str:
         """One chat call to the co-located document reader's vLLM server."""
-        import base64 as _b64
-        import io as _io
-
         import httpx
 
-        buf = _io.BytesIO()
+        buf = io.BytesIO()
         img.save(buf, format="PNG")
-        data_url = "data:image/png;base64," + _b64.b64encode(buf.getvalue()).decode()
+        data_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
         resp = httpx.post(
             f"{self.config.ocr_vlm_url.rstrip('/')}/v1/chat/completions",
             json={
                 "model": self.config.ocr_vlm_served_name,
-                "temperature": 0.0,
-                "max_tokens": _token_budget(img, self.config.ocr_max_new_tokens),
+                # Upstream's sampling. Measured this way against the reader it replaced.
+                "temperature": 0.1,
+                "top_p": 1.0,
+                "max_tokens": budget,
                 "messages": [
                     {
                         "role": "user",
                         "content": [
                             {"type": "image_url", "image_url": {"url": data_url}},
-                            {"type": "text", "text": prompt},
+                            # The image placeholder spelled out, as upstream sends it: left
+                            # to the server, vLLM inserts a newline before the instruction.
+                            {"type": "text", "text": "<|img|><|imgpad|><|endofimg|>" + _DOC_READER_PROMPT},
                         ],
                     }
                 ],
@@ -1270,70 +1102,47 @@ class InterfazeLiteModel(PreTrainedModel):
         resp.raise_for_status()
         return (resp.json()["choices"][0]["message"]["content"] or "").strip()
 
-    def _read_document_json(self, img) -> list[contracts.VLMRegion]:
-        """an alternative document model -> (bbox, category, text) tuples in reading order. No confidence."""
-        ocr = self._component("ocr_vlm")
-        model, processor = ocr["model"], ocr["processor"]
-        prompt = (
-            "Extract the layout as JSON: a list of "
-            '{"bbox":[x1,y1,x2,y2],"category":...,"text":...} in reading order.'
-        )
-        inputs = processor(images=img, text=prompt, return_tensors="pt").to(self._torch_device)
-
-        # The processor can emit keys the model's generate() rejects, and which keys
-        # depends on the transformers/checkpoint pairing. Filtering against forward()'s
-        # signature looked tidy but strips arguments generate() manages itself (it left
-        # cache_position unset, which the custom modeling code then indexed into).
-        #
-        # Instead: try the full input, and if transformers names the unused keys in its
-        # error, drop exactly those and retry once. Precise, and version-proof.
-        out = _generate(model, inputs, max_new_tokens=8192)
-        return _parse_layout(processor.decode(out[0], skip_special_tokens=True), img)
-
-    # -------------------------------------------------------------------- audio
-
-    # The only inference path here that was missing this, and the one that could least
-    # afford to be: the recogniser's word-timestamp mode keeps per-layer cross-attention
-    # tensors, so without inference_mode they stay reachable after the call returns.
-    # Perception's live allocation climbed 15.2 -> 17.1 -> 18.2 GiB across successive
-    # requests on a card with nothing left to give, and transcription OOMed on 2 MiB.
+    # Word timestamps keep cross-attention tensors reachable without inference_mode: live memory
+    # climbed 15.2 -> 18.2 GiB across requests until transcription OOMed.
     @torch.inference_mode()
     def transcribe(
-        self, audio: str, *, by_speaker: bool = False, language: str = "auto", word_timestamps: bool = False,
+        self,
+        audio: str,
+        *,
+        by_speaker: bool = False,
+        language: str = "auto",
+        word_timestamps: bool = False,
         words_for_speakers: bool = False,
     ) -> dict:
         """Transcribe, and optionally attribute each word to a speaker.
 
-        Language selection routes between two models rather than picking one compromise:
-        the fast recogniser covers 25 languages with better English WER and native word timestamps;
-        the speech recogniser covers 99 and takes everything else. Their multilingual averages are the
-        same, so this is a coverage decision, not an accuracy one.
+        Returns `{text, language_detected: {code, confidence}, chunks}`: timed segments, words when
+        `word_timestamps` or `words_for_speakers`, grouped by speaker when `by_speaker`. With
+        ENABLE_FAST_ASR, `config.asr_languages` go to the fast recogniser and the rest to the
+        speech recogniser -- a coverage choice, as their multilingual averages match.
         """
         requested = (language or "auto").lower()
         use_fast_asr = _fast_asr_enabled() and requested in self.config.asr_languages
-        # Words cost the recogniser four times what segments do, so they are decoded only
-        # when something reads them: the caller, or the speaker join. For the join alone,
-        # a long recording's are estimated (`asr_exact_words_up_to_s`).
+        # Words cost four times what segments do, so they are decoded only when something reads
+        # them; for the speaker join alone, a long recording's are estimated (`asr_exact_words_up_to_s`).
         need_words = by_speaker or word_timestamps or words_for_speakers
-        estimate_after_s = (None if word_timestamps
-                            else getattr(self.config, "asr_exact_words_up_to_s", None))
+        estimate_after_s = None if word_timestamps else getattr(self.config, "asr_exact_words_up_to_s", None)
 
         if use_fast_asr:
             words, detected = self._transcribe_fast(audio), requested
             units = words if need_words else _segments(words)
         else:
-            units, detected = self._transcribe_long_form(audio, requested, words=need_words,
-                                                         estimate_after_s=estimate_after_s)
+            units, detected = self._transcribe_long_form(
+                audio, requested, words=need_words, estimate_after_s=estimate_after_s
+            )
 
         result: dict[str, Any] = {
             "text": " ".join(u.text for u in units),
-            # What the model actually decoded, not the caller's "auto" echoed back.
+            # The language the model decoded; the request's value only when none was detected.
             "language_detected": {"code": _language_code(detected) or requested, "confidence": 1.0},
         }
 
         # Always timed, as interfaze returns them: segments by default, words when asked.
-        # This returned [] unless words were requested, which dropped timing the
-        # recogniser had already computed.
         if by_speaker:
             turns = self.diarize(audio)
             result["chunks"] = contracts.group_by_speaker(
@@ -1357,9 +1166,8 @@ class InterfazeLiteModel(PreTrainedModel):
             model = self._component("asr")
             out = model.transcribe([audio], timestamps=True)[0]
         except Exception as exc:
-            # the fast recogniser's toolkit imports torchaudio.io, removed in torchaudio 2.9 and replaced by
-            # TorchCodec; it also cannot fetch remote audio through lhotse here. Any
-            # failure degrades to the speech recogniser, which covers every language the fast recogniser does.
+            # Its toolkit imports torchaudio.io (gone in torchaudio 2.9) and cannot fetch remote audio
+            # here; the speech recogniser covers every language it does.
             print(
                 f"[asr] the fast recogniser unavailable ({type(exc).__name__}: {exc}); "
                 f"falling back to the speech recogniser",
@@ -1372,16 +1180,16 @@ class InterfazeLiteModel(PreTrainedModel):
         ]
 
     def _transcribe_long_form(
-        self, audio: str, language: str | None = None, *, words: bool = False,
+        self,
+        audio: str,
+        language: str | None = None,
+        *,
+        words: bool = False,
         estimate_after_s: float | None = None,
     ) -> tuple[list[contracts.Word], str | None]:
         """Timed spans -- words, or segments -- plus the language actually used.
 
-        `language` was previously accepted by the tool, forwarded through the service
-        and then dropped here, so asking for a specific language did nothing at all.
-        the speech recogniser takes it as a decoder prompt; given none, it detects one, and
-        `return_language` is how that detection is recovered instead of reporting the
-        caller's "auto" back to them as though it were a result.
+        `language` goes in as the decoder prompt; given none, `return_language` recovers the detected one.
         """
         from transformers.pipelines.audio_utils import ffmpeg_read
 
@@ -1390,8 +1198,10 @@ class InterfazeLiteModel(PreTrainedModel):
         if len(samples) > self.config.asr_window_after_s * _ASR_RATE:
             estimate = words and estimate_after_s is not None and len(samples) > estimate_after_s * _ASR_RATE
             if estimate:
-                print(f"[asr] {len(samples) / _ASR_RATE / 60:.0f} min: word timing estimated "
-                      f"from segments", flush=True)
+                print(
+                    f"[asr] {len(samples) / _ASR_RATE / 60:.0f} min: word timing estimated from segments",
+                    flush=True,
+                )
             units, detected = _transcribe_windows(
                 asr,
                 samples,
@@ -1402,8 +1212,9 @@ class InterfazeLiteModel(PreTrainedModel):
             return (contracts.estimate_words(units) if estimate else units), detected
 
         generate = dict(_RECOGNISER_GUARDS)
-        if language and language != "auto":
-            generate["language"] = language
+        explicit_language = _explicit_language(language)
+        if explicit_language:
+            generate["language"] = explicit_language
         call: dict = {
             "return_language": True,
             "return_timestamps": "word" if words else True,
@@ -1417,14 +1228,8 @@ class InterfazeLiteModel(PreTrainedModel):
             # the caller's mistake rather than a reason to return nothing.
             out = asr(audio, return_timestamps=True)
         except IndexError:
-            # Word-level timestamps are collated inside transformers, and that
-            # collation indexes past the end of its own list on some generations
-            # (the recogniser's tokenizer, `_decode_asr`). It took the whole capability down:
-            # the caller got a 500 and was told transcription was unavailable, when
-            # the audio had in fact been recognised and only the per-word alignment
-            # failed. Segment timestamps come from a different path, so the text and
-            # coarse timing survive; callers that wanted word timing get chunks that
-            # are longer than a word rather than nothing at all.
+            # Word-timestamp collation (`_decode_asr`) indexes past its own list on some generations;
+            # segment timing takes another path, so text and coarse timing survive.
             print("[asr] word timestamps failed to collate; using segment timing", flush=True)
             out = asr(audio, **{**call, "return_timestamps": True})
 
@@ -1440,20 +1245,16 @@ class InterfazeLiteModel(PreTrainedModel):
             )
             for chunk in chunks
         ]
-        return words, (language if language and language != "auto" else detected)
+        return words, (explicit_language or detected)
 
-    # ------------------------------------------------------------------ the brain
-
-    @torch.inference_mode()
     @torch.inference_mode()
     def ground(self, image, prompts: Sequence[str] | None = None) -> dict:
         """Locate UI elements in a screenshot, as the service's gui_detection tool does.
 
-        Runs on the brain rather than a GUI specialist: it grounds well enough on
-        ScreenSpot-v2 that a second model would cost VRAM without a matching gain. With
-        no prompts it finds every interactive element. Returns
-        `{"gui_elements": [{type, bounds}], width, height}` in the image's own pixels,
-        each element typed by the phrase that found it, as interfaze types them.
+        Runs on the brain, which grounds ScreenSpot-v2 well enough that a GUI specialist would
+        cost VRAM without a matching gain. With no prompts it finds every interactive element.
+        Returns `{"gui_elements": [{type, bounds}], width, height}` in the image's own pixels,
+        `type` the phrase that found it, or "icon" when no prompts were given.
         """
         wanted = [p for p in (prompts or []) if p and p.strip()]
         everything = not wanted
@@ -1583,9 +1384,8 @@ class InterfazeLiteModel(PreTrainedModel):
     def _show_images(self, convo: list[dict], refs: dict[str, str]) -> list[dict]:
         """The caller's images, put beside the conversation once a tool has read them.
 
-        Withheld until then: shown an image first, the model transcribes it by eye and
-        invents text. With the reading in hand, the image carries what the text cannot
-        -- the highlighted item on a receipt, a colour, a crossed-out line.
+        Shown first, the model transcribes by eye and invents text; after the reading, the image
+        carries what text cannot -- a highlighted item, a colour, a crossed-out line.
         """
         images = []
         for path in refs.values():
@@ -1595,7 +1395,7 @@ class InterfazeLiteModel(PreTrainedModel):
                 images.append(_fit_pixels(_load_image(path), self.config.object_ground_max_pixels))
             except Exception:
                 continue
-            if len(images) == 4:
+            if len(images) == _MAX_SHOWN_IMAGES:
                 break
         users = [i for i, m in enumerate(convo) if m.get("role") == "user" and m.get("content") != NUDGE]
         if not images or not users:
@@ -1614,13 +1414,8 @@ class InterfazeLiteModel(PreTrainedModel):
         return shown
 
 
-# ----------------------------------------------------------------------- helpers
-
-
-# Keys a vision-language generate() genuinely needs. If transformers reports one of
-# these as "not used by the model", the model was loaded with the wrong auto class --
-# dropping it would silently discard the image and produce confident nonsense, so the
-# error is raised instead.
+# Keys a vision-language generate() needs: reported "not used by the model", they mean the wrong
+# auto class, and dropping them would silently discard the image (see `_generate`).
 _ESSENTIAL_INPUTS = frozenset(
     {
         "input_ids",
@@ -1633,13 +1428,34 @@ _ESSENTIAL_INPUTS = frozenset(
 )
 
 
+def _stand_in_for_flash_attn() -> None:
+    """Let the reader's vision code import flash_attn where it is not installed.
+
+    It imports flash_attn at module level even under SDPA, and flash-attn has no wheel for most
+    torch/CUDA pairings; the stand-in raises if anything calls it.
+    """
+    import importlib.machinery
+    import importlib.util
+    import sys
+    import types
+
+    if "flash_attn" in sys.modules or importlib.util.find_spec("flash_attn") is not None:
+        return
+
+    def flash_attn_varlen_func(*_args, **_kwargs):
+        raise RuntimeError("flash_attn is not installed: run the document reader with OCR_ATTN_IMPL=sdpa")
+
+    stand_in = types.ModuleType("flash_attn")
+    stand_in.__spec__ = importlib.machinery.ModuleSpec("flash_attn", None)
+    stand_in.flash_attn_varlen_func = flash_attn_varlen_func
+    sys.modules["flash_attn"] = stand_in
+
+
 def _stop_ids(model, processor) -> list[int]:
     """The ids a turn ends on: the checkpoint's own, plus <|im_end|>.
 
-    These checkpoints end a turn with <|im_end|> but list only <|endoftext|> in their
-    generation config. A serving engine stops at both; generate() stopped at neither, so
-    one page was read on to the 8192-token cap -- 140 regions instead of 16, in five
-    minutes.
+    Their generation configs list only <|endoftext|>, so generate() read one page on to the
+    8192-token cap -- 140 regions instead of 16.
     """
     ids = model.generation_config.eos_token_id
     ids = [ids] if isinstance(ids, int) else list(ids or [])
@@ -1650,12 +1466,7 @@ def _stop_ids(model, processor) -> list[int]:
 
 
 def _generate(model, inputs, *, max_new_tokens: int, eos_token_id: list[int] | None = None):
-    """generate() that tolerates surplus processor keys but never drops the image.
-
-    Processors emit auxiliary tensors that some model versions do not accept, and
-    transformers raises rather than ignoring them. Those are safe to drop. Anything in
-    _ESSENTIAL_INPUTS is not.
-    """
+    """generate() that drops surplus processor keys transformers rejects, but never _ESSENTIAL_INPUTS."""
     kwargs = dict(inputs)
     stop = {"eos_token_id": eos_token_id} if eos_token_id else {}
     for _ in range(3):
@@ -1682,18 +1493,18 @@ def _generate(model, inputs, *, max_new_tokens: int, eos_token_id: list[int] | N
 
 _ASR_RATE = 16_000
 
-# One recogniser call on the GPU at a time, across requests. A word-timed pass peaks near
-# 5 GB; six concurrent transcriptions took the card to 81 MiB free and the brain's vLLM
-# engine, sharing it, died of the OOM. Taken per call rather than per transcription: held
-# for a whole recording, one 95-minute file kept every other transcription waiting ~90 s.
+# Most images shown beside the conversation once a tool has read them (`_show_images`).
+_MAX_SHOWN_IMAGES = 4
+
+# One recogniser call on the GPU at a time: six concurrent transcriptions OOMed the brain's vLLM
+# engine sharing the card. Per call, not per recording, which kept others waiting ~90 s.
 _RECOGNISER = threading.Lock()
 
-# The guard's probability of "unsafe" a verdict needs to block (see `moderate`).
-_GUARD_UNSAFE_THRESHOLD = 0.8
+# P("Unsafe") a verdict needs to block (see `moderate`). Chosen in evals/guard/guard_bench.py: the safe
+# requests it flags score 0.93 or more, and every step up cost recall on every public set.
+_GUARD_UNSAFE_THRESHOLD = 0.5
 
-# The segmenter keeps the image it was given between set_image and predict. Two requests
-# interleaving there cut one image's masks from the other's embedding. Held for that pair
-# only -- about a tenth of a second -- not for the request around it.
+# Held between set_image and predict only: interleaved, one image's masks came from another's embedding.
 _SEGMENTER = threading.Lock()
 
 
@@ -1716,15 +1527,13 @@ def _loops(text: str, threshold: float = 2.4) -> bool:
 def _transcribe_windows(
     asr, samples, language: str | None, *, words: bool, batch_size: int
 ) -> tuple[list[contracts.Word], str | None]:
-    """Long audio decoded as interfaze's recogniser decodes it: in windows, in batches.
+    """Long audio decoded as interfaze's recogniser does: in windows (`contracts.speech_windows`), in batches.
 
-    Cut at quiet points into windows of at most 30 s (`contracts.speech_windows`), each
-    is one short-form decode, and `batch_size` of them run at once. The language is
-    detected once, on the first window, as the sequential decoder detects it -- and
-    because transformers 5.15 cannot split a batched result that carries languages.
+    The language is detected once, on the first window: transformers 5.15 cannot split a batched
+    result that carries languages.
     """
     windows = contracts.speech_windows(samples, _ASR_RATE)
-    detected = language if language and language != "auto" else None
+    detected = _explicit_language(language)
     if not windows:
         return [], detected
     generate = dict(_RECOGNISER_GUARDS)
@@ -1749,12 +1558,9 @@ def _transcribe_windows(
         return {"raw": samples[s:e], "sampling_rate": _ASR_RATE}
 
     def decode(timestamps):
-        """Every window, a batch at a time, halving the batch while it does not fit.
+        """Every window, a batch at a time, halving the batch while it does not fit on the shared card.
 
-        The card is shared, so what fits changes with everything else running. A 95-minute
-        recording with word timing ran out of memory at 16 windows a batch and returned a
-        500. Once halved, the rest of the recording keeps the smaller size: started again
-        at 16 for every batch, it spent each one failing its way down to 4.
+        Once halved, the size sticks: reset each batch, it failed its way down every time.
         """
         # One batch per call, so another request waits for a batch, not the recording.
         outs, size, first = [], batch_size, 0
@@ -1772,14 +1578,15 @@ def _transcribe_windows(
             except torch.cuda.OutOfMemoryError:
                 if len(indices) == 1:
                     raise
-            # Retried past the except clause. Inside it, the live exception's traceback
-            # holds the failed batch's frames and every tensor in them: each half ran out
-            # of memory against the same 18 GB, down to a single window.
+            # Retried past the except clause, whose live traceback holds the failed batch's tensors:
+            # inside it, each half OOMed against the same 18 GB.
             gc.collect()
             torch.cuda.empty_cache()
             size = len(indices) // 2
-            print(f"[asr] a batch of {len(indices)} windows did not fit in memory; "
-                  f"going on {size} at a time", flush=True)
+            print(
+                f"[asr] a batch of {len(indices)} windows did not fit in memory; going on {size} at a time",
+                flush=True,
+            )
         # A window that decoded into a loop is redone alone, where the guards'
         # temperature fallback works.
         return [
@@ -1814,10 +1621,8 @@ def _transcribe_windows(
 def _waveform(audio, rate: int = 16_000) -> dict:
     """Audio decoded in memory, mono at `rate`, in the form the diarization pipeline takes.
 
-    Handed a compressed file, the pipeline's own decoder can come up a few samples short
-    of the length it computed -- "resulted in 439895 samples instead of the expected
-    441000" -- and fail the whole recording. The service converts to WAV first; this
-    decodes with the same ffmpeg the speech recogniser reads files with.
+    The pipeline's own decoder can come up a few samples short on compressed audio ("439895
+    samples instead of the expected 441000") and fail the recording.
     """
     from transformers.pipelines.audio_utils import ffmpeg_read
 
@@ -1826,11 +1631,7 @@ def _waveform(audio, rate: int = 16_000) -> dict:
 
 
 def _paddle_name(folder: str) -> str:
-    """A bundled PaddleOCR model's own name, from the inference config saved beside it.
-
-    PaddleOCR checks the name it is given against the folder's, so the name has to come
-    from the folder rather than from a default or from this repo's config.
-    """
+    """A bundled PaddleOCR model's own name, which PaddleOCR checks, from the inference.yml beside it."""
     import yaml
 
     with open(os.path.join(folder, "inference.yml"), encoding="utf-8") as f:
@@ -1838,21 +1639,51 @@ def _paddle_name(folder: str) -> str:
 
 
 def _fit_pixels(img, max_pixels: int):
-    """Downscale to a pixel budget, preserving aspect ratio.
-
-    Visual tokens are roughly pixels/1024 for this model family, so an unbounded image
-    is an unbounded prefill. Upstream the document reader ships scale_to_fit for the same reason;
-    this is the dependency-free equivalent.
-    """
+    """Downscale to a pixel budget, preserving aspect ratio; visual tokens are roughly pixels/1024."""
     pixels = img.width * img.height
     if pixels <= max_pixels:
         return img
     scale = (max_pixels / pixels) ** 0.5
-    # Land on the 32px patch grid, or the processor pads and the coordinate frame that
-    # data-bbox refers to stops matching the image we measured.
+    # Land on the brain's 32px patch grid, or its processor pads and the coordinate frame
+    # its boxes refer to stops matching the image they were measured on.
     width = max(32, int(img.width * scale) // 32 * 32)
     height = max(32, int(img.height * scale) // 32 * 32)
     return img.resize((width, height))
+
+
+def _snap_to_grid(img, grid: int):
+    """The nearest size whose sides are multiples of `grid` -- what the reader's own
+    processor would resize to -- so the image sent is the image whose pixels its boxes
+    count."""
+    width = max(grid, round(img.width / grid) * grid)
+    height = max(grid, round(img.height / grid) * grid)
+    return img if (width, height) == img.size else img.resize((width, height))
+
+
+# The document reader's patch grid: 14 px patches merged 2x2.
+_DOC_READER_GRID = 28
+
+# The document reader's layout instruction, verbatim from upstream's prompt map
+# ("prompt_layout_all_en"). The model is trained against this wording, and
+# contracts.read_layout parses the JSON it asks for.
+_DOC_READER_PROMPT = """Please output the layout information from the PDF image, including each layout element's bbox, its category, and the corresponding text content within the bbox.
+
+1. Bbox format: [x1, y1, x2, y2]
+
+2. Layout Categories: The possible categories are ['Caption', 'Footnote', 'Formula', 'List-item', 'Page-footer', 'Page-header', 'Picture', 'Section-header', 'Table', 'Text', 'Title'].
+
+3. Text Extraction & Formatting Rules:
+    - Picture: For the 'Picture' category, the text field should be omitted.
+    - Formula: Format its text as LaTeX.
+    - Table: Format its text as HTML.
+    - All Others (Text, Title, etc.): Format their text as Markdown.
+
+4. Constraints:
+    - The output text must be the original text from the image, with no translation.
+    - All layout elements must be sorted according to human reading order.
+
+5. Final Output: The entire output must be a single JSON object.
+"""
 
 
 def _upscale(img, factor: int):
@@ -1865,37 +1696,21 @@ def _upscale(img, factor: int):
 
 
 def _token_budget(img, ceiling: int) -> int:
-    """Output budget proportional to how much page there is to describe.
-
-    A stop sign needs a few hundred tokens; a dense page needs thousands. Handing both
-    the ceiling means the small case pays the large case's decode latency whenever the
-    model declines to emit a stop token.
-    """
+    """Output budget proportional to how much page there is, so a sparse page cannot run to the ceiling."""
     approx_visual_tokens = (img.width * img.height) // 1024
     return int(max(512, min(ceiling, approx_visual_tokens * 4)))
 
 
-def _pixmap_to_image(pixmap):
-    from PIL import Image
-
-    return Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
-
-
 def _ocr_docx(source) -> dict:
-    """Read a .docx directly. No rasterising, no OCR.
+    """Read a .docx's text directly: it holds the text exactly, which OCR could only degrade.
 
-    The text is already exact in the file; rendering it to pixels and recognising it
-    back can only introduce errors. There are no bounding boxes for the same reason --
-    a Word document has no fixed pixel layout until it is rendered, so any box would be
-    invented. Callers relying on `sections[].lines[].bounds` get empty geometry rather
-    than plausible fiction.
+    No bounding boxes: a Word document has no pixel layout until rendered, so any box would be invented.
     """
-    import io as _io
     import xml.etree.ElementTree as ET
     import zipfile
 
     ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-    with zipfile.ZipFile(_io.BytesIO(contracts.fetch_bytes(source))) as zf:
+    with zipfile.ZipFile(io.BytesIO(contracts.fetch_bytes(source))) as zf:
         root = ET.fromstring(zf.read("word/document.xml"))
 
     paragraphs = []
@@ -1917,14 +1732,7 @@ def _ocr_docx(source) -> dict:
 
 
 def _read_text_document(source) -> dict:
-    """Return a plain-text file as-is. Nothing to recognise.
-
-    A CSV or log is already exact characters. Rasterising it and reading the pixels
-    back could only introduce errors, and previously it was not even attempted -- the
-    bytes went to the image reader, which failed with "cannot identify image file" and
-    surfaced as a 500. Geometry is empty for the same reason as .docx: a text file has
-    no pixel layout until something renders it, so any box would be invented.
-    """
+    """Return a plain-text file as-is, without geometry (see `_ocr_docx`)."""
     raw = contracts.fetch_bytes(source)
     body = raw.decode("utf-8", errors="replace")
     lines = [line for line in body.splitlines() if line.strip()]
@@ -1958,16 +1766,13 @@ _OUTLINE_UNAVAILABLE = False
 def _outline_of(mask) -> list[list[int]] | None:
     """Outline of a boolean mask's largest region as [[x, y], ...], or None.
 
-    Only the largest region, so an object split by an occluder is described by its
-    main body rather than by a ring around both halves. `bounds` remains the thing to
-    read for full extent; this is for shape.
+    An occluded object is described by its main body; `bounds` gives its full extent.
     """
     try:
         import cv2
         import numpy as np
     except Exception as exc:  # pragma: no cover - depends on the image
-        # Said once and plainly. Swallowing this returned every object without an
-        # outline and no reason anywhere, which reads as "this image has no shapes".
+        # Said once: swallowed, it reads as "this image has no shapes".
         global _OUTLINE_UNAVAILABLE
         if not _OUTLINE_UNAVAILABLE:
             _OUTLINE_UNAVAILABLE = True
@@ -2013,35 +1818,3 @@ def _encode_mask_array(mask) -> str:
     buf = io.BytesIO()
     Image.fromarray((mask * 255).astype("uint8"), mode="L").save(buf, format="PNG", optimize=True)
     return base64.b64encode(buf.getvalue()).decode()
-
-
-def _parse_layout(raw: str, img) -> list[contracts.VLMRegion]:
-    import json
-    import re
-
-    match = re.search(r"\[.*\]", raw, re.S)
-    if not match:
-        return []
-    try:
-        items = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return []
-
-    regions: list[contracts.VLMRegion] = []
-    for item in items:
-        bbox = item.get("bbox")
-        if not bbox or len(bbox) != 4:
-            continue
-        try:
-            bounds = contracts.to_bounds(bbox, src="xyxy", img_w=img.width, img_h=img.height)
-        except ValueError:
-            continue  # a malformed box must not take the whole page down
-        regions.append(
-            contracts.VLMRegion(
-                text=item.get("text", ""),
-                bounds=bounds,
-                category=item.get("category", ""),
-            )
-        )
-    return regions
-

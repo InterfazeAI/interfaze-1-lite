@@ -1,50 +1,33 @@
-"""Request validation for /v1/chat/completions.
-
-Rejecting a malformed request costs a few microseconds here; letting it through costs
-a GPU-seconds-long round trip that ends in a 500. Every check below returns a 4xx with
-a message naming the offending field, because a caller debugging against a remote
-endpoint has nothing else to go on.
-"""
+"""Request validation for /v1/chat/completions: a 4xx naming the bad field, before any GPU time is spent."""
 
 from __future__ import annotations
 
 import base64
 import binascii
+import hmac
 import re
 from typing import Any
 
 TASKS = ("ocr", "stt", "object_detection", "gui_detection", "translate", "forecast")
 
-# A routed task may be named differently from the tool that serves it. Transcription
-# is routed as `speech_to_text` but reports itself as `stt` in precontext, and both
-# names are published -- so accepting only one of them breaks callers written against
-# the other. The alias resolves to a tool; what the caller is told it ran is the name
-# the caller used.
+# Both names are published: transcription is routed as `speech_to_text` but reports itself as `stt`.
 TASK_ALIASES = {"speech_to_text": "stt"}
 
 _TASK_TAG = re.compile(r"<task>(.*?)</task>", re.IGNORECASE | re.DOTALL)
 
-# `developer` is OpenAI's newer name for `system`, and the SDKs send it by default for
-# recent models -- which is how it reaches this service. Accepting the same four roles
-# interfaze does, and collapsing the alias the same way, keeps one wire contract rather
-# than two that differ by which SDK version the caller happens to run.
+# `developer` is OpenAI's newer `system`, sent by the SDKs for recent models; collapsed as interfaze does.
 ROLE_ALIASES = {"developer": "system"}
 ROLES = ("system", "user", "assistant", "tool", *ROLE_ALIASES)
 
 
 def normalise_roles(messages: list[dict]) -> list[dict]:
-    """Collapse role aliases before anything downstream reads a role.
-
-    Widening the accepted set alone is not enough: the task tag and the caller's own
-    system prompt are both found by testing `role == "system"`, so a `developer` turn
-    would validate and then be silently ignored -- no error, and the instructions in it
-    simply absent from the request.
-    """
+    """Collapse role aliases first: the task tag and system prompt are found by `role == "system"`."""
     if not any(m.get("role") in ROLE_ALIASES for m in messages if isinstance(m, dict)):
         return messages
-    return [{**m, "role": ROLE_ALIASES[m["role"]]}
-            if isinstance(m, dict) and m.get("role") in ROLE_ALIASES else m
-            for m in messages]
+    return [
+        {**m, "role": ROLE_ALIASES[m["role"]]} if isinstance(m, dict) and m.get("role") in ROLE_ALIASES else m
+        for m in messages
+    ]
 
 
 class RequestError(Exception):
@@ -60,18 +43,12 @@ def _texts(message: dict) -> list[str]:
     if isinstance(content, str):
         return [content]
     if isinstance(content, list):
-        return [p.get("text", "") for p in content
-                if isinstance(p, dict) and p.get("type") == "text"]
+        return [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
     return []
 
 
 def extract_task(messages: list[dict]) -> str | None:
-    """Pull a single `<task>name</task>` directive out of the system turns.
-
-    The SDK's typed `task=` argument lowers to this tag, so it is the wire format even
-    though callers rarely write it by hand. Only one task may be routed per request:
-    the tag names the tool to force, and "force two tools" has no meaning.
-    """
+    """Pull the single `<task>name</task>` directive from the system turns; the SDK's `task=` lowers to it."""
     found: list[str] = []
     for message in messages:
         if message.get("role") != "system":
@@ -87,24 +64,19 @@ def extract_task(messages: list[dict]) -> str | None:
     names = [n.strip() for n in found[0].split(",") if n.strip()]
     if len(names) > 1:
         raise RequestError(
-            f"only one task may be specified per request, got {len(names)}: "
-            + ", ".join(names))
+            f"only one task may be specified per request, got {len(names)}: " + ", ".join(names)
+        )
     if not names:
-        # `<task></task>` names nothing, which is a request to route nothing -- the
-        # same state as omitting the tag. Rejecting it turned a harmless empty
-        # template slot into a 400 on an otherwise valid request.
+        # An empty `<task></task>` routes nothing, as if omitted; rejecting it 400'd empty template slots.
         return None
 
     task = names[0].lower()
     if task not in TASKS and task not in TASK_ALIASES:
-        raise RequestError(
-            f"invalid task '{task}'. Supported tasks: "
-            + ", ".join((*TASKS, *TASK_ALIASES)))
+        raise RequestError(f"invalid task '{task}'. Supported tasks: " + ", ".join((*TASKS, *TASK_ALIASES)))
     return task
 
 
 def resolve_task(task: str) -> str:
-    """The tool that serves a routed task name."""
     return TASK_ALIASES.get(task, task)
 
 
@@ -119,26 +91,28 @@ def strip_task_tags(messages: list[dict]) -> list[dict]:
         if isinstance(content, str):
             out.append({**message, "content": _TASK_TAG.sub("", content).strip()})
         elif isinstance(content, list):
-            out.append({**message, "content": [
-                {**p, "text": _TASK_TAG.sub("", p["text"]).strip()}
-                if isinstance(p, dict) and p.get("type") == "text" and "text" in p else p
-                for p in content
-            ]})
+            out.append(
+                {
+                    **message,
+                    "content": [
+                        {**p, "text": _TASK_TAG.sub("", p["text"]).strip()}
+                        if isinstance(p, dict) and p.get("type") == "text" and "text" in p
+                        else p
+                        for p in content
+                    ],
+                }
+            )
         else:
             out.append(message)
     return out
 
 
 def _check_data_uri(url: str) -> None:
-    """A data: URI that is not decodable is a client bug, not a perception failure.
-
-    Left unchecked it surfaces much later as an unreadable-image error from whichever
-    tool happened to receive it, which points the caller at the wrong thing entirely.
-    """
+    """Reject an undecodable data: URI here; downstream it surfaced as a misleading unreadable-image error."""
     if not url.startswith("data:"):
         return
-    header, _, payload = url.partition(",")
-    if not _:
+    header, separator, payload = url.partition(",")
+    if not separator:
         raise RequestError("malformed data URI: missing ',' separator")
     if "base64" not in header:
         return
@@ -174,9 +148,15 @@ def validate_messages(messages: Any) -> None:
                     has_content = True
                 elif kind in ("image_url", "input_image"):
                     has_content = True
-                    url = (part.get("image_url") or {}).get("url") if kind == "image_url" \
+                    url = (
+                        (part.get("image_url") or {}).get("url")
+                        if kind == "image_url"
                         else part.get("image_url")
+                    )
                     if isinstance(url, str):
+                        # Anything else is a path on this server, which the tools would read.
+                        if not url.startswith(("http://", "https://", "data:")):
+                            raise RequestError("image_url must be an http(s) URL or a data: URI")
                         _check_data_uri(url)
                 elif kind in ("input_audio", "audio_url", "file", "file_url", "video_url"):
                     has_content = True
@@ -187,19 +167,18 @@ def validate_messages(messages: Any) -> None:
         raise RequestError("request has no text content: every message is empty")
 
 
-def check_api_key(header: str | None, expected: str | None,
-                  admin_header: str | None = None, admin_expected: str | None = None) -> None:
-    """Enforce a shared key only when one is configured.
+def check_api_key(
+    header: str | None,
+    expected: str | None,
+    admin_header: str | None = None,
+    admin_expected: str | None = None,
+) -> None:
+    """Enforce a shared key only when one is configured; Settings.api_key says why it ships open.
 
-    interfaze-lite ships open by default -- it is a container you run yourself, and
-    demanding a key from someone's own localhost is friction with no security value.
-    Setting API_KEY turns enforcement on for a deployment that is actually exposed, as a
-    Bearer token. ADMIN_KEY is how the hosted deployment is called: by the interfaze API, in
-    `x-api-admin-key`, as every one of its model services is. With either set, a request
-    must carry one that matches.
+    `header` is the Authorization header, matched against API_KEY with or without a
+    `Bearer ` prefix; `admin_header` is `x-api-admin-key`, matched against ADMIN_KEY.
+    With either key set, a request must carry one that matches.
     """
-    import hmac
-
     if not expected and not admin_expected:
         return
     token = ""
@@ -215,11 +194,7 @@ def check_api_key(header: str | None, expected: str | None,
     raise RequestError("invalid API key", status=401)
 
 
-# OpenAI's own documented ranges. Out-of-range values were previously passed straight
-# through to the inference server, which either clamped them silently or failed deep in
-# the engine with a message about a field the caller never named -- so an obvious typo
-# surfaced as a 500 from somewhere else entirely, or as output that quietly ignored
-# what was asked for.
+# OpenAI's documented ranges; past them the inference server clamped silently or failed with a 500.
 _RANGES: dict[str, tuple[float, float]] = {
     "temperature": (0.0, 2.0),
     "top_p": (0.0, 1.0),
@@ -249,5 +224,4 @@ def validate_sampling(body: dict, *, max_output_tokens: int) -> None:
     if tokens < 1:
         raise RequestError(f"max_tokens must be at least 1, got {tokens}")
     if tokens > max_output_tokens:
-        raise RequestError(
-            f"max_tokens must be at most {max_output_tokens}, got {tokens}")
+        raise RequestError(f"max_tokens must be at most {max_output_tokens}, got {tokens}")

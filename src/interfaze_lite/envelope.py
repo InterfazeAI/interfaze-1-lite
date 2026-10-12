@@ -13,9 +13,8 @@ Two rules are easy to break in a rewrite and both break real clients:
 
 2. Streaming cannot carry top-level fields, because clients drop unknown keys on
    chunks. Interfaze therefore smuggles precontext through the content stream wrapped
-   in literal `<precontext> ... </precontext>` sentinel tags. Any client that parses
-   those out will break if we deviate, so this is reproduced verbatim rather than
-   improved.
+   in literal `<precontext> ... </precontext>` sentinel tags. Clients parse those out,
+   so the format is reproduced verbatim rather than improved.
 
 `vcache` and the `cached_tokens` usage details are carried as interfaze carries them,
 always present, though this service has no vector cache and they are always false and
@@ -75,11 +74,8 @@ class Usage:
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "total_tokens": self.total_tokens,
-            # Always present, even at zero. Clients read reasoning tokens from here and
-            # an absent key is indistinguishable from a client-side mapping bug, so a
-            # turn that did not think has to say so rather than stay silent.
-            "completion_tokens_details": {"reasoning_tokens": self.reasoning_tokens,
-                                          "cached_tokens": 0},
+            # Always present, even at zero: an absent key reads as a client-side mapping bug.
+            "completion_tokens_details": {"reasoning_tokens": self.reasoning_tokens, "cached_tokens": 0},
             "prompt_tokens_details": {"cached_tokens": 0},
         }
 
@@ -117,26 +113,22 @@ class Completion:
         if self.reasoning:
             out["reasoning"] = self.reasoning
         out["usage"] = self.usage.as_dict()
-        # ALWAYS present, even as []. Omitting it when no tool ran forces every caller
-        # to write defensive `body.get("precontext") or []`, and an SDK that models the
-        # response as a typed object will report the attribute as missing rather than
-        # empty. A stable key is worth more than the ability to distinguish "no tools
-        # ran" from "tools ran and returned nothing" -- which the array's contents
-        # already tell you anyway.
+        # ALWAYS present, even as []: a typed SDK reports a missing attribute, not an empty one.
         out["precontext"] = [p.as_dict() for p in self.precontext]
         out["vcache"] = False
         return out
 
     def message(self, content: str, finish_reason: FinishReason = "stop") -> dict[str, Any]:
-        """A normal assistant reply."""
         return {
             **self._base(),
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": content},
-                "logprobs": None,
-                "finish_reason": finish_reason,
-            }],
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "logprobs": None,
+                    "finish_reason": finish_reason,
+                }
+            ],
         }
 
     def tool_calls(self, calls: list[ToolCall], context: list[dict] | None = None) -> dict[str, Any]:
@@ -147,26 +139,30 @@ class Completion:
         """
         return {
             **self._base(),
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [c.as_dict() for c in calls],
-                    **({"interfaze_context": context} if context else {}),
-                },
-                "logprobs": None,
-                "finish_reason": "tool_calls",
-            }],
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [c.as_dict() for c in calls],
+                        **({"interfaze_context": context} if context else {}),
+                    },
+                    "logprobs": None,
+                    "finish_reason": "tool_calls",
+                }
+            ],
         }
 
 
-# ------------------------------------------------------------------ streaming
-
-
-def _chunk(request_id: str, model: str, created: int, delta: dict[str, Any],
-           finish_reason: FinishReason | None = None,
-           usage: dict[str, int] | None = None) -> dict[str, Any]:
+def _chunk(
+    request_id: str,
+    model: str,
+    created: int,
+    delta: dict[str, Any],
+    finish_reason: FinishReason | None = None,
+    usage: dict[str, int] | None = None,
+) -> dict[str, Any]:
     out: dict[str, Any] = {
         "id": request_id,
         "object": "chat.completion.chunk",
@@ -180,7 +176,6 @@ def _chunk(request_id: str, model: str, created: int, delta: dict[str, Any],
 
 
 def sse(payload: dict[str, Any] | str) -> str:
-    """Frame one server-sent event. `[DONE]` is passed through as a bare string."""
     if isinstance(payload, str):
         return f"data: {payload}\n\n"
     return f"data: {json.dumps(payload, separators=(',', ':'))}\n\n"
@@ -191,16 +186,9 @@ def precontext_delta(completion: Completion) -> dict[str, Any]:
 
     Reproduces interfaze byte-for-byte, including the spaces inside the tags:
     `<precontext> {...} </precontext>`. Clients grep for these, so the spacing is part
-    of the contract.
-
-    Whether to emit it at all is the caller's decision, not this function's. A stream
-    carries no top-level fields, so the block is the only way to ship precontext -- but
-    it lands in `content`, which means a client that did not ask for it gets tool JSON
-    spliced into the assistant's prose. The request header is what distinguishes the
-    two, so the streaming path consults it and skips this chunk entirely when unset.
+    of the contract. It lands in `content`, so send it only to a caller that asked for it.
     """
-    body = json.dumps([p.as_dict() for p in completion.precontext], separators=(",", ":"),
-                      ensure_ascii=False)
+    body = json.dumps([p.as_dict() for p in completion.precontext], separators=(",", ":"), ensure_ascii=False)
     return _chunk(
         completion.request_id,
         completion.model,
@@ -209,48 +197,54 @@ def precontext_delta(completion: Completion) -> dict[str, Any]:
     )
 
 
-def tool_call_deltas(completion: Completion,
-                     calls: list[ToolCall]) -> Iterator[dict[str, Any]]:
-    """A tool-call turn, chunked.
-
-    The buffered and streamed forms have to describe the same turn, and previously only
-    the buffered one existed -- asking for a stream and a tool call together returned a
-    whole JSON body instead of an event stream, so an OpenAI-compatible client saw no
-    chunks, no tool call and a null finish_reason.
-
-    `index` is what lets a client reassemble arguments split across chunks; it is
-    required even when each call arrives whole, as it does here.
-    """
+def tool_call_deltas(completion: Completion, calls: list[ToolCall]) -> Iterator[dict[str, Any]]:
+    """A tool-call turn, chunked. `index` reassembles split arguments; required even for whole calls."""
     for index, call in enumerate(calls):
-        yield _chunk(completion.request_id, completion.model, completion.created, {
-            "tool_calls": [{
-                "index": index,
-                "id": call.id,
-                "type": "function",
-                "function": {"name": call.name, "arguments": call.arguments},
-            }],
-        })
+        yield _chunk(
+            completion.request_id,
+            completion.model,
+            completion.created,
+            {
+                "tool_calls": [
+                    {
+                        "index": index,
+                        "id": call.id,
+                        "type": "function",
+                        "function": {"name": call.name, "arguments": call.arguments},
+                    }
+                ],
+            },
+        )
 
 
-def stream(completion: Completion, content_parts: list[str],
-           finish_reason: FinishReason = "stop") -> Iterator[str]:
-    """Full SSE sequence: role, precontext, content deltas, finish, [DONE].
-
-    Emitting the role in its own leading chunk with empty content is what the OpenAI
+def stream(
+    completion: Completion, content_parts: list[str], finish_reason: FinishReason = "stop"
+) -> Iterator[str]:
+    """Emitting the role in its own leading chunk with empty content is what the OpenAI
     SDKs expect; some clients use it to open the message before any text arrives.
     """
-    yield sse(_chunk(completion.request_id, completion.model, completion.created,
-                     {"role": "assistant", "content": ""}))
+    yield sse(
+        _chunk(
+            completion.request_id, completion.model, completion.created, {"role": "assistant", "content": ""}
+        )
+    )
 
     yield sse(precontext_delta(completion))
 
     for part in content_parts:
         if part:
-            yield sse(_chunk(completion.request_id, completion.model, completion.created,
-                             {"content": part}))
+            yield sse(_chunk(completion.request_id, completion.model, completion.created, {"content": part}))
 
-    yield sse(_chunk(completion.request_id, completion.model, completion.created,
-                     {}, finish_reason=finish_reason, usage=completion.usage.as_dict()))
+    yield sse(
+        _chunk(
+            completion.request_id,
+            completion.model,
+            completion.created,
+            {},
+            finish_reason=finish_reason,
+            usage=completion.usage.as_dict(),
+        )
+    )
     yield sse("[DONE]")
 
 
@@ -267,7 +261,7 @@ def parse_precontext(stream_text: str) -> list[dict[str, Any]] | None:
     end = stream_text.find(PRECONTEXT_CLOSE, start)
     if end == -1:
         return None
-    body = stream_text[start + len(PRECONTEXT_OPEN):end].strip()
+    body = stream_text[start + len(PRECONTEXT_OPEN) : end].strip()
     try:
         return json.loads(body)
     except json.JSONDecodeError:
@@ -275,11 +269,10 @@ def parse_precontext(stream_text: str) -> list[dict[str, Any]] | None:
 
 
 def strip_precontext(stream_text: str) -> str:
-    """Remove the sentinel block, leaving only user-visible content."""
     start = stream_text.find(PRECONTEXT_OPEN)
     if start == -1:
         return stream_text
     end = stream_text.find(PRECONTEXT_CLOSE, start)
     if end == -1:
         return stream_text
-    return (stream_text[:start] + stream_text[end + len(PRECONTEXT_CLOSE):]).lstrip()
+    return (stream_text[:start] + stream_text[end + len(PRECONTEXT_CLOSE) :]).lstrip()

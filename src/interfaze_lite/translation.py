@@ -1,10 +1,8 @@
 """Translation: interfaze's prompts, chunking and language list, served by the brain.
 
-Ported from interfaze's `helpers/translation.ts` and the `translate` tool
-(`tools/index.ts`, `tools/helpers.ts`). The model differs -- interfaze calls a hosted
-LLM, lite asks its own brain -- and nothing else does: the same system and user prompts,
-the same one-object schema, the same 5,000-character chunks re-joined on the separator
-they were cut at, and the same 163 language codes. Pure: the tool supplies the brain.
+Ported from interfaze's `helpers/translation.ts` and the `translate` tool (`tools/index.ts`,
+`tools/helpers.ts`). Only the model differs: interfaze calls a hosted LLM, lite its own brain.
+Pure: the tool supplies the brain.
 """
 
 from __future__ import annotations
@@ -28,12 +26,16 @@ SCHEMA = {
     },
 }
 
-_ONE_WORD = ("You are a professional dictionary. Don't translate acronyms, abbreviations, "
-             "brand names and proper nouns.")
-_SENTENCE = ("You are a professional translation engine. Maintain the original meaning, tone "
-             "and structure of the text. Text may contain multiple languages. Translate all "
-             "of them to the target language. Don't translate acronyms, abbreviations, brand "
-             "names and proper nouns.")
+_ONE_WORD = (
+    "You are a professional dictionary. Don't translate acronyms, abbreviations, "
+    "brand names and proper nouns."
+)
+_SENTENCE = (
+    "You are a professional translation engine. Maintain the original meaning, tone "
+    "and structure of the text. Text may contain multiple languages. Translate all "
+    "of them to the target language. Don't translate acronyms, abbreviations, brand "
+    "names and proper nouns."
+)
 
 
 @lru_cache(maxsize=1)
@@ -45,8 +47,10 @@ def languages() -> dict[str, dict]:
 
 def unsupported(code: str) -> str:
     """The error interfaze returns for a target code outside its list."""
-    return (f'"{code}" is not a supported language code. Use a valid ISO 639-1 two-letter '
-            "code (e.g., 'es', 'fr', 'ja', 'zh').")
+    return (
+        f'"{code}" is not a supported language code. Use a valid ISO 639-1 two-letter '
+        "code (e.g., 'es', 'fr', 'ja', 'zh')."
+    )
 
 
 def prompts(text: str, target_language: str, current_language: str | None = None) -> tuple[str, str]:
@@ -74,8 +78,7 @@ def prompts(text: str, target_language: str, current_language: str | None = None
 def split_into_chunks(text: str, max_len: int = MAX_CHARS_PER_CHUNK) -> tuple[list[str], list[str]]:
     """Chunks of at most `max_len`, cut at a paragraph, sentence or word where possible.
 
-    Returns the separator each cut consumed, so the translations can be re-joined on it:
-    each translated chunk comes back trimmed, and joining on "" fused words.
+    Also returns each cut's separator: translations come back trimmed, and joining on "" fused words.
     """
     if len(text) <= max_len:
         return [text], []
@@ -85,8 +88,7 @@ def split_into_chunks(text: str, max_len: int = MAX_CHARS_PER_CHUNK) -> tuple[li
     while len(remaining) > max_len:
         cut, used = -1, ""
         for sep in ("\n\n", "\n", ". ", "? ", "! ", " "):
-            # JS lastIndexOf(sep, maxLen - sep.length): a match starting at or before that
-            # index, i.e. one that ends by max_len.
+            # JS lastIndexOf(sep, maxLen - sep.length): the last match that ends by max_len.
             idx = remaining.rfind(sep, 0, max_len)
             if idx > max_len * 0.5:
                 cut, used = idx, sep
@@ -95,7 +97,7 @@ def split_into_chunks(text: str, max_len: int = MAX_CHARS_PER_CHUNK) -> tuple[li
             cut, used = max_len, ""
         chunks.append(remaining[:cut])
         separators.append(used)
-        remaining = remaining[cut + len(used):]
+        remaining = remaining[cut + len(used) :]
     if remaining:
         chunks.append(remaining)
     return chunks, separators
@@ -103,9 +105,7 @@ def split_into_chunks(text: str, max_len: int = MAX_CHARS_PER_CHUNK) -> tuple[li
 
 def stitch(translated: list[str], separators: list[str]) -> str:
     """One item's translated chunks, re-joined on the separators they were cut at."""
-    if not translated:
-        return ""
     out = translated[0]
-    for i, piece in enumerate(translated[1:]):
-        out += (separators[i] if i < len(separators) and separators[i] else " ") + piece
+    for separator, piece in zip(separators, translated[1:], strict=False):
+        out += (separator or " ") + piece
     return out

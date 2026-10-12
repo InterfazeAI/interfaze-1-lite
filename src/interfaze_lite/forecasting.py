@@ -1,15 +1,7 @@
 """Forecasting: interfaze's dataset parsing and pre-processing, and its TimesFM service's.
 
-Two sources, ported so their behaviour does not move:
-
-- interfaze `helpers/forecastDataset.ts` and `helpers/forecast/index.ts`: a CSV or JSON
-  file (or an inline list) becomes `{date, value}` points; dates without a time get
-  " 00:00:00"; points are sorted; values on the same date are summed; five unique dates
-  are the minimum and 1,000 points the maximum.
-- JigsawStack's `prediction-timesfm` service: dates parsed and sorted, the step inferred
-  from them, the horizon clamped to what the model was compiled for, and the forecast
-  rounded to integers when every input was one.
-
+Ported so their behaviour does not move: interfaze `helpers/forecastDataset.ts` and
+`helpers/forecast/index.ts` through `series`, JigsawStack's `prediction-timesfm` service after it.
 Pure, apart from pandas/numpy imported where they are used.
 """
 
@@ -104,8 +96,9 @@ def looks_like_date(text: str) -> bool:
         return False
 
 
-def rows_to_dataset(rows: list[list[str]], date_column: str | None = None,
-                    value_column: str | None = None) -> list[dict]:
+def rows_to_dataset(
+    rows: list[list[str]], date_column: str | None = None, value_column: str | None = None
+) -> list[dict]:
     """CSV rows as `{date, value}` points, choosing the columns the way interfaze does."""
     if not rows:
         return []
@@ -121,8 +114,9 @@ def rows_to_dataset(rows: list[list[str]], date_column: str | None = None,
         try:
             return lower.index(name.strip().lower())
         except ValueError:
-            raise DatasetError(f'{kind} column "{name}" not found. '
-                               f"Available columns: {', '.join(header)}.") from None
+            raise DatasetError(
+                f'{kind} column "{name}" not found. Available columns: {", ".join(header)}.'
+            ) from None
 
     date_idx = hint(date_column, "Date")
     value_idx = hint(value_column, "Value")
@@ -141,17 +135,24 @@ def rows_to_dataset(rows: list[list[str]], date_column: str | None = None,
     # several is genuinely ambiguous (date,open,close) and asks for value_column.
     if value_idx == -1 and date_idx != -1:
         sample = (rows[1:] if has_header else rows)[:5]
-        numeric = [i for i in range(count) if i != date_idx and sample
-                   and all(i < len(r) and math.isfinite(coerce_number(r[i])) for r in sample)]
+        numeric = [
+            i
+            for i in range(count)
+            if i != date_idx
+            and sample
+            and all(i < len(r) and math.isfinite(coerce_number(r[i])) for r in sample)
+        ]
         if len(numeric) == 1:
             value_idx = numeric[0]
 
     if date_idx == -1 or value_idx == -1 or date_idx == value_idx:
-        raise DatasetError(f"Could not determine date and value columns from: {', '.join(header)}. "
-                           "Specify date_column and value_column explicitly.")
+        raise DatasetError(
+            f"Could not determine date and value columns from: {', '.join(header)}. "
+            "Specify date_column and value_column explicitly."
+        )
 
     dataset = []
-    for r in (rows[1:] if has_header else rows):
+    for r in rows[1:] if has_header else rows:
         if date_idx >= len(r) or value_idx >= len(r):
             continue
         date = (r[date_idx] or "").strip()
@@ -163,12 +164,14 @@ def rows_to_dataset(rows: list[list[str]], date_column: str | None = None,
 
 
 def json_to_dataset(parsed, date_column: str | None = None, value_column: str | None = None) -> list[dict]:
-    """`[{date, value}]`, `[[date, value]]`, or either wrapped in {data|dataset|series}."""
+    """`[{date, value}]`, `[[date, value]]`, or either wrapped in {data|dataset|series|predictions}."""
     arr = parsed
     if isinstance(parsed, dict):
         # JavaScript's `??`: the first key that is present, even when it holds [].
-        arr = next((parsed[k] for k in ("data", "dataset", "series", "predictions")
-                    if parsed.get(k) is not None), parsed)
+        arr = next(
+            (parsed[k] for k in ("data", "dataset", "series", "predictions") if parsed.get(k) is not None),
+            parsed,
+        )
     if not isinstance(arr, list):
         return []
     date_keys = [k for k in (date_column, "date", "ds", "timestamp", "time", "day", "period") if k]
@@ -192,24 +195,29 @@ def json_to_dataset(parsed, date_column: str | None = None, value_column: str | 
     return dataset
 
 
-def parse_dataset(text: str, *, url: str = "", content_type: str = "",
-                  date_column: str | None = None, value_column: str | None = None) -> list[dict]:
+def parse_dataset(
+    text: str,
+    *,
+    url: str = "",
+    content_type: str = "",
+    date_column: str | None = None,
+    value_column: str | None = None,
+) -> list[dict]:
     """A dataset file's text as points, JSON or CSV by content type, extension or first byte."""
-    looks_json = ("json" in content_type.lower() or re.search(r"\.json(\?|#|$)", url, re.I)
-                  or re.match(r"^\s*[\[{]", text))
+    looks_json = (
+        "json" in content_type.lower()
+        or re.search(r"\.json(\?|#|$)", url, re.I)
+        or re.match(r"^\s*[\[{]", text)
+    )
     if looks_json:
         return json_to_dataset(json.loads(text), date_column, value_column)
     return rows_to_dataset(parse_csv(text), date_column, value_column)
 
 
 def dataset_from_text(text: str) -> list[dict]:
-    """The series written into a message: its longest run of comma rows, read as CSV.
+    """The series written in a message: its longest run of rows with one comma count, as CSV; empty if none.
 
-    The model otherwise copies a pasted table into its tool call row by row. At 365
-    rows that ran past the tool turn's token limit, and the cut-off call arrived with
-    no data at all -- eight times, and then no answer. Rows are grouped by their comma
-    count, so a sentence with a comma before the table is not its header. Empty when
-    there is no usable series.
+    Spares the model copying a pasted table into a tool call, which ran past the token limit (CUT_OFF_CALL).
     """
     best: list[str] = []
     run: list[str] = []
@@ -224,8 +232,7 @@ def dataset_from_text(text: str) -> list[dict]:
                 best = list(run)
         else:
             run, shape = [], None
-    # A sentence with as many commas as the rows ("Forecast this, please:") lands at the
-    # top of the run; leading lines are dropped until what is left reads as a table.
+    # Drop a lead-in with the rows' comma count ("Forecast this, please:") until the rest reads as a table.
     for start in range(min(3, len(best))):
         if len(best) - start < MIN_FORECAST_POINTS:
             break
@@ -260,14 +267,15 @@ def series(dataset: list[dict]) -> dict[str, float]:
     points.sort(key=lambda p: _timestamp(p["date"]))
     y: dict[str, float] = {}
     for p in points:
-        v = float(p["value"]) if not isinstance(p["value"], str) else float(p["value"])
+        v = float(p["value"])
         y[p["date"]] = y[p["date"]] + v if p["date"] in y else v
     if len(y) < MIN_FORECAST_POINTS:
         raise DatasetError("At least 5 unique dates are required")
     return y
 
 
-# --- the TimesFM service's side -------------------------------------------------------
+# Ported from JigsawStack's prediction-timesfm service.
+
 
 def parse_dates_sorted(y: dict[str, float]) -> tuple[list[datetime], list[float]]:
     import pandas as pd
@@ -315,8 +323,9 @@ def future_timestamps(last: datetime, horizon: int, step: timedelta) -> list[str
 
 
 def all_integers(values) -> bool:
-    return all(not isinstance(v, bool) and isinstance(v, (int, float)) and abs(v - round(v)) < 1e-9
-               for v in values)
+    return all(
+        not isinstance(v, bool) and isinstance(v, (int, float)) and abs(v - round(v)) < 1e-9 for v in values
+    )
 
 
 def _is_number(text: str) -> bool:
