@@ -2,7 +2,7 @@
 
 # Interfaze 1.1 Lite
 
-[Website](https://interfaze.ai) · [Docs](https://interfaze.ai/docs/models/interfaze-1-lite) · [Run tasks](https://interfaze.ai/docs/run-tasks) · [Blog](https://interfaze.ai/blog/the-first-open-weight-model-for-deterministic-work-interfaze-1-lite) · [Hugging Face](https://huggingface.co/interfaze-ai/interfaze-1-lite)
+[Website](https://interfaze.ai) · [Docs](https://interfaze.ai/docs/models/interfaze-1.1-lite) · [Run tasks](https://interfaze.ai/docs/run-tasks) · [Blog](https://interfaze.ai/blog/introducing-interfaze-1-1-lite) · [Hugging Face](https://huggingface.co/interfaze-ai/interfaze-1-lite)
 
 ## Introduction
 
